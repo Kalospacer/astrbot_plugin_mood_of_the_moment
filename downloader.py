@@ -25,7 +25,9 @@ class RemoteImageDownloader:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(image_url) as response:
                     if response.status != 200:
-                        logger.warning(f"此刻的心情: 下载图片失败，状态码: {response.status}")
+                        logger.warning(
+                            f"此刻的心情: 下载图片失败，状态码: {response.status}"
+                        )
                         return None
                     content = await response.read()
                     if not content or len(content) < 100:

@@ -76,10 +76,14 @@ class DHashDedupService:
                 return await self.storage.get_asset(item.asset_id)
         return None
 
-    async def register_file(self, file_path: Path, asset: StickerAsset | None = None) -> None:
+    async def register_file(
+        self, file_path: Path, asset: StickerAsset | None = None
+    ) -> None:
         if asset is None:
             try:
-                relative_key = str(file_path.resolve().relative_to(self.paths.stickers_dir.resolve())).replace("\\", "/")
+                relative_key = str(
+                    file_path.resolve().relative_to(self.paths.stickers_dir.resolve())
+                ).replace("\\", "/")
             except ValueError:
                 relative_key = str(file_path)
             asset = await self.storage.get_asset_by_storage_key(relative_key)
@@ -115,7 +119,9 @@ class DHashDedupService:
                 storage_key = str(payload.get("storage_key") or "").strip()
                 dhash = str(payload.get("dhash") or "").strip()
                 if storage_key and dhash:
-                    result[asset_id] = IndexedHash(asset_id=asset_id, storage_key=storage_key, dhash=dhash)
+                    result[asset_id] = IndexedHash(
+                        asset_id=asset_id, storage_key=storage_key, dhash=dhash
+                    )
             return result
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             logger.warning(f"此刻的心情: 读取 dHash 索引失败，将重建: {exc}")
@@ -135,7 +141,11 @@ class DHashDedupService:
             file_path = await self.storage.resolve_path(asset.storage_key)
             image_hash = await self.compute_dhash(file_path)
             if image_hash:
-                self.index[asset.asset_id] = IndexedHash(asset_id=asset.asset_id, storage_key=asset.storage_key, dhash=image_hash)
+                self.index[asset.asset_id] = IndexedHash(
+                    asset_id=asset.asset_id,
+                    storage_key=asset.storage_key,
+                    dhash=image_hash,
+                )
                 changed = True
         if changed:
             await asyncio.to_thread(self._persist_index_sync)

@@ -63,11 +63,15 @@ class StickerRenderer:
             )
         return markers
 
-    def _score_asset_match(self, requested_tags: tuple[str, ...], candidate_tags: list[str]) -> float:
+    def _score_asset_match(
+        self, requested_tags: tuple[str, ...], candidate_tags: list[str]
+    ) -> float:
         if not requested_tags:
             return 0.0
         normalized_requested = [tag.strip() for tag in requested_tags if tag.strip()]
-        normalized_candidate = [str(tag).strip() for tag in candidate_tags if str(tag).strip()]
+        normalized_candidate = [
+            str(tag).strip() for tag in candidate_tags if str(tag).strip()
+        ]
         if not normalized_candidate:
             return 0.0
 
@@ -94,7 +98,9 @@ class StickerRenderer:
             score -= 0.5
         return score
 
-    def _iter_tag_subsets(self, requested_tags: tuple[str, ...]) -> list[tuple[str, ...]]:
+    def _iter_tag_subsets(
+        self, requested_tags: tuple[str, ...]
+    ) -> list[tuple[str, ...]]:
         normalized = tuple(tag for tag in requested_tags if tag)
         subsets: list[tuple[str, ...]] = []
         for size in range(len(normalized), 0, -1):
@@ -103,7 +109,9 @@ class StickerRenderer:
             subsets.extend(level)
         return subsets
 
-    def _pick_top_scored_asset(self, scored_assets: list[tuple[float, dict]]) -> dict | None:
+    def _pick_top_scored_asset(
+        self, scored_assets: list[tuple[float, dict]]
+    ) -> dict | None:
         if not scored_assets:
             return None
         scored_assets.sort(
@@ -126,10 +134,17 @@ class StickerRenderer:
             if exact_assets:
                 if len(subset) == len(requested_tags):
                     return random.choice(exact_assets)
-                return self._pick_top_scored_asset([
-                    (self._score_asset_match(requested_tags, list(asset.get("tags") or [])), asset)
-                    for asset in exact_assets
-                ])
+                return self._pick_top_scored_asset(
+                    [
+                        (
+                            self._score_asset_match(
+                                requested_tags, list(asset.get("tags") or [])
+                            ),
+                            asset,
+                        )
+                        for asset in exact_assets
+                    ]
+                )
 
         candidates = await self.storage.get_all_memes()
         if not candidates:
@@ -145,14 +160,18 @@ class StickerRenderer:
     async def decorate_text(self, text: str, scope_key: str) -> DecoratedContent:
         markers = self.parse_markers(text)
         if not markers:
-            return DecoratedContent(segments=[DecoratedSegment(kind="text", value=text)])
+            return DecoratedContent(
+                segments=[DecoratedSegment(kind="text", value=text)]
+            )
 
         segments: list[DecoratedSegment] = []
         cursor = 0
         stickers_used = 0
         for marker in markers:
             if marker.start > cursor:
-                segments.append(DecoratedSegment(kind="text", value=text[cursor:marker.start]))
+                segments.append(
+                    DecoratedSegment(kind="text", value=text[cursor : marker.start])
+                )
 
             meme_data = await self._select_best_asset(marker.tags)
             if meme_data is not None and stickers_used < self.max_stickers_per_message:
@@ -164,7 +183,9 @@ class StickerRenderer:
                     if meme_id:
                         await self.storage.increment_usage_count(meme_id, scope_key)
                 else:
-                    segments.append(DecoratedSegment(kind="text", value=marker.raw_text))
+                    segments.append(
+                        DecoratedSegment(kind="text", value=marker.raw_text)
+                    )
             else:
                 segments.append(DecoratedSegment(kind="text", value=marker.raw_text))
             cursor = marker.end

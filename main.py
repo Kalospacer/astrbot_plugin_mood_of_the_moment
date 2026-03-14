@@ -42,7 +42,9 @@ class MoodOfTheMomentPlugin(Star):
             metadata_db=self.data_dir / "stickers.sqlite3",
             default_dir=self.plugin_dir / "default",
         )
-        self.facade = PluginFacade(paths=self.paths, context=context, plugin_config=self.config)
+        self.facade = PluginFacade(
+            paths=self.paths, context=context, plugin_config=self.config
+        )
         self.steal_tool = StealMemesTool(facade=self.facade)
         self._auto_collect_tasks: set[asyncio.Task] = set()
         StarTools.unregister_llm_tool(STEAL_TOOL_NAME)
@@ -79,10 +81,17 @@ class MoodOfTheMomentPlugin(Star):
         for item in message_chain:
             if not isinstance(item, Image):
                 continue
-            if not self.facade.should_auto_collect_item(item):
-                continue
+            should_collect, reason = self.facade.explain_auto_collect_item(item)
             image_url = item.url or item.path
+            logger.info(
+                f"{PLUGIN_NAME}: 收到图片消息 unified_msg_origin={event.unified_msg_origin} "
+                f"group_id={event.get_group_id()} sender_id={event.get_sender_id()} "
+                f"image_url={image_url or ''} decision={should_collect} reason={reason}"
+            )
+            if not should_collect:
+                continue
             if not image_url:
+                logger.warning(f"{PLUGIN_NAME}: 图片消息缺少 url/path，跳过自动采集")
                 continue
             task = asyncio.create_task(
                 self.facade.maybe_auto_collect_image(
@@ -92,6 +101,7 @@ class MoodOfTheMomentPlugin(Star):
                 )
             )
             self._track_task(task)
+            logger.info(f"{PLUGIN_NAME}: 已创建自动采集任务 image_url={image_url}")
             scheduled = True
         if scheduled:
             cleanup_task = asyncio.create_task(self.facade.maybe_run_cleanup())
@@ -133,7 +143,9 @@ class MoodOfTheMomentPlugin(Star):
         )
         if not items:
             await event.send(
-                MessageChain().message("当前会话里还没有 cleanroom foundation 发出的图片记录。")
+                MessageChain().message(
+                    "当前会话里还没有 cleanroom foundation 发出的图片记录。"
+                )
             )
             return
         lines = [f"当前会话最近 {len(items)} 条图片资产记录："]
@@ -145,10 +157,14 @@ class MoodOfTheMomentPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("smile_delete")
-    async def delete_asset_command(self, event: AstrMessageEvent, asset_id: str = "") -> None:
+    async def delete_asset_command(
+        self, event: AstrMessageEvent, asset_id: str = ""
+    ) -> None:
         normalized_asset_id = asset_id.strip()
         if not normalized_asset_id:
-            await event.send(MessageChain().message("请使用 smile_delete <asset_id> 删除图片资产。"))
+            await event.send(
+                MessageChain().message("请使用 smile_delete <asset_id> 删除图片资产。")
+            )
             return
         result = await self.facade.delete_asset(normalized_asset_id)
         await event.send(MessageChain().message(result.message))
@@ -158,7 +174,9 @@ class MoodOfTheMomentPlugin(Star):
         if self._auto_collect_tasks:
             for task in list(self._auto_collect_tasks):
                 task.cancel()
-            await asyncio.gather(*list(self._auto_collect_tasks), return_exceptions=True)
+            await asyncio.gather(
+                *list(self._auto_collect_tasks), return_exceptions=True
+            )
             self._auto_collect_tasks.clear()
         await self.facade.shutdown()
         logger.info(f"{PLUGIN_NAME}: 插件已停止")

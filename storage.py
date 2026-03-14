@@ -11,8 +11,18 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .constants import DEFAULT_CATEGORY, DEFAULT_CATEGORY_DESCRIPTION, SUPPORTED_IMAGE_SUFFIXES
-from .models import PluginPaths, StickerAsset, StickerAssetDraft, StickerGroup, StickerUsageEvent
+from .constants import (
+    DEFAULT_CATEGORY,
+    DEFAULT_CATEGORY_DESCRIPTION,
+    SUPPORTED_IMAGE_SUFFIXES,
+)
+from .models import (
+    PluginPaths,
+    StickerAsset,
+    StickerAssetDraft,
+    StickerGroup,
+    StickerUsageEvent,
+)
 from .utils import safe_filename
 
 
@@ -23,7 +33,9 @@ class StickerStorage:
 
     async def initialize(self) -> None:
         await asyncio.to_thread(self.paths.data_dir.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(self.paths.stickers_dir.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(
+            self.paths.stickers_dir.mkdir, parents=True, exist_ok=True
+        )
         async with self._lock:
             await asyncio.to_thread(self._init_database_sync)
             await asyncio.to_thread(self._ensure_default_groups_sync)
@@ -204,7 +216,9 @@ class StickerStorage:
         labels: tuple[str, ...] = (),
         limit: int | None = None,
     ) -> list[StickerAsset]:
-        return await asyncio.to_thread(self._query_assets_sync, group_name, labels, limit)
+        return await asyncio.to_thread(
+            self._query_assets_sync, group_name, labels, limit
+        )
 
     def _query_assets_sync(
         self,
@@ -212,9 +226,7 @@ class StickerStorage:
         labels: tuple[str, ...] = (),
         limit: int | None = None,
     ) -> list[StickerAsset]:
-        sql = (
-            "SELECT asset_id, group_name, storage_key, original_name, mime_hint, description, source, created_at, usage_count, last_used_at, labels_json FROM sticker_assets"
-        )
+        sql = "SELECT asset_id, group_name, storage_key, original_name, mime_hint, description, source, created_at, usage_count, last_used_at, labels_json FROM sticker_assets"
         params: list[object] = []
         if group_name:
             sql += " WHERE group_name = ?"
@@ -275,6 +287,36 @@ class StickerStorage:
             row = conn.execute("SELECT COUNT(*) FROM sticker_assets").fetchone()
         return int(row[0]) if row else 0
 
+    async def prune_missing_assets(self) -> list[str]:
+        async with self._lock:
+            return await asyncio.to_thread(self._prune_missing_assets_sync)
+
+    def _prune_missing_assets_sync(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT asset_id, storage_key FROM sticker_assets"
+            ).fetchall()
+            stale_asset_ids: list[str] = []
+            for row in rows:
+                asset_id = str(row[0] or "").strip()
+                storage_key = str(row[1] or "").strip()
+                if not asset_id or not storage_key:
+                    continue
+                if not self._resolve_path_sync(storage_key).exists():
+                    stale_asset_ids.append(asset_id)
+            if not stale_asset_ids:
+                return []
+            conn.executemany(
+                "DELETE FROM sticker_usage WHERE asset_id = ?",
+                [(asset_id,) for asset_id in stale_asset_ids],
+            )
+            conn.executemany(
+                "DELETE FROM sticker_assets WHERE asset_id = ?",
+                [(asset_id,) for asset_id in stale_asset_ids],
+            )
+            conn.commit()
+        return stale_asset_ids
+
     async def record_usage(self, event: StickerUsageEvent) -> None:
         async with self._lock:
             await asyncio.to_thread(self._record_usage_sync, event)
@@ -291,16 +333,23 @@ class StickerStorage:
             )
             conn.commit()
 
-    async def list_recent_usage(self, scope_key: str, limit: int) -> list[StickerUsageEvent]:
+    async def list_recent_usage(
+        self, scope_key: str, limit: int
+    ) -> list[StickerUsageEvent]:
         return await asyncio.to_thread(self._list_recent_usage_sync, scope_key, limit)
 
-    def _list_recent_usage_sync(self, scope_key: str, limit: int) -> list[StickerUsageEvent]:
+    def _list_recent_usage_sync(
+        self, scope_key: str, limit: int
+    ) -> list[StickerUsageEvent]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT asset_id, scope_key, created_at FROM sticker_usage WHERE scope_key = ? ORDER BY created_at DESC LIMIT ?",
                 (scope_key, limit),
             ).fetchall()
-        return [StickerUsageEvent(asset_id=row[0], scope_key=row[1], created_at=row[2]) for row in rows]
+        return [
+            StickerUsageEvent(asset_id=row[0], scope_key=row[1], created_at=row[2])
+            for row in rows
+        ]
 
     async def import_file(
         self,
@@ -308,7 +357,9 @@ class StickerStorage:
         group_name: str,
         preferred_name: str | None = None,
     ) -> tuple[str, str]:
-        return await asyncio.to_thread(self._import_file_sync, source_path, group_name, preferred_name)
+        return await asyncio.to_thread(
+            self._import_file_sync, source_path, group_name, preferred_name
+        )
 
     def _import_file_sync(
         self,
@@ -319,12 +370,19 @@ class StickerStorage:
         self.paths.stickers_dir.mkdir(parents=True, exist_ok=True)
         target_dir = self.paths.stickers_dir / group_name
         target_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = safe_filename(preferred_name or source_path.name, source_path.suffix or ".jpg")
+        safe_name = safe_filename(
+            preferred_name or source_path.name, source_path.suffix or ".jpg"
+        )
         target_path = target_dir / safe_name
         if target_path.exists():
-            target_path = target_dir / f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
+            target_path = (
+                target_dir
+                / f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
+            )
         shutil.copy2(source_path, target_path)
-        storage_key = str(target_path.relative_to(self.paths.stickers_dir)).replace("\\", "/")
+        storage_key = str(target_path.relative_to(self.paths.stickers_dir)).replace(
+            "\\", "/"
+        )
         return storage_key, target_path.name
 
     async def resolve_path(self, storage_key: str) -> Path:
@@ -389,9 +447,13 @@ class StickerStorage:
             )
         return result
 
-    async def increment_usage_count(self, asset_id: str, scope_key: str = "legacy-render") -> None:
+    async def increment_usage_count(
+        self, asset_id: str, scope_key: str = "legacy-render"
+    ) -> None:
         await self.record_usage(
-            StickerUsageEvent(asset_id=asset_id, scope_key=scope_key, created_at=time.time())
+            StickerUsageEvent(
+                asset_id=asset_id, scope_key=scope_key, created_at=time.time()
+            )
         )
 
     async def update_asset_source(self, asset_id: str, source: str) -> None:
@@ -433,7 +495,9 @@ class StickerStorage:
             normalized_storage_key = str(Path(file_path))
             if Path(file_path).is_absolute():
                 normalized_storage_key = str(
-                    Path(file_path).resolve().relative_to(self.paths.stickers_dir.resolve())
+                    Path(file_path)
+                    .resolve()
+                    .relative_to(self.paths.stickers_dir.resolve())
                 ).replace("\\", "/")
             group_name = tags[0] if tags else DEFAULT_CATEGORY
             with self._connect() as conn:
@@ -444,7 +508,9 @@ class StickerStorage:
                     """,
                     (
                         group_name,
-                        DEFAULT_CATEGORY_DESCRIPTION if group_name == DEFAULT_CATEGORY else "",
+                        DEFAULT_CATEGORY_DESCRIPTION
+                        if group_name == DEFAULT_CATEGORY
+                        else "",
                     ),
                 )
                 conn.execute(
@@ -482,14 +548,28 @@ class StickerStorage:
         total_count = len(assets)
         total_usage = sum(asset.usage_count for asset in assets)
         avg_usage = total_usage / total_count if total_count else 0
-        least_used = min(assets, key=lambda item: (item.usage_count, item.created_at), default=None)
-        most_used = max(assets, key=lambda item: (item.usage_count, item.created_at), default=None)
+        least_used = min(
+            assets, key=lambda item: (item.usage_count, item.created_at), default=None
+        )
+        most_used = max(
+            assets, key=lambda item: (item.usage_count, item.created_at), default=None
+        )
         return {
             "total_count": total_count,
             "total_usage": total_usage,
             "avg_usage": avg_usage,
-            "least_used": {"meme_id": least_used.asset_id, "usage_count": least_used.usage_count} if least_used else None,
-            "most_used": {"meme_id": most_used.asset_id, "usage_count": most_used.usage_count} if most_used else None,
+            "least_used": {
+                "meme_id": least_used.asset_id,
+                "usage_count": least_used.usage_count,
+            }
+            if least_used
+            else None,
+            "most_used": {
+                "meme_id": most_used.asset_id,
+                "usage_count": most_used.usage_count,
+            }
+            if most_used
+            else None,
         }
 
     async def get_least_used_memes(self, count: int) -> list[dict[str, Any]]:
@@ -561,7 +641,9 @@ class StickerStorage:
             "added_time": asset.created_at,
         }
 
-    async def get_meme_by_file_path(self, file_path: str | Path) -> dict[str, Any] | None:
+    async def get_meme_by_file_path(
+        self, file_path: str | Path
+    ) -> dict[str, Any] | None:
         target = Path(file_path).resolve()
         for asset in await self.query_assets():
             resolved_path = await self.resolve_path(asset.storage_key)
@@ -584,4 +666,7 @@ class StickerStorage:
         return True
 
     async def iter_all_sticker_files(self) -> list[Path]:
-        return [await self.resolve_path(asset.storage_key) for asset in await self.query_assets()]
+        return [
+            await self.resolve_path(asset.storage_key)
+            for asset in await self.query_assets()
+        ]

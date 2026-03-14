@@ -65,6 +65,14 @@ class PluginFacade:
 
     async def startup(self) -> None:
         await self.storage.initialize()
+        stale_asset_ids = await self.storage.prune_missing_assets()
+        if stale_asset_ids:
+            logger.info(
+                f"此刻的心情: 启动时清理失效资产 {len(stale_asset_ids)} 个: "
+                + ", ".join(stale_asset_ids[:10])
+            )
+        else:
+            logger.info("此刻的心情: 启动时未发现失效资产")
         await self.dedup.initialize()
         await self._import_default_catalog()
         await self._import_legacy_sqlite_if_present()
@@ -120,7 +128,9 @@ class PluginFacade:
                 labels=(normalize_tag_display_name(group_name),),
             )
         )
-        await self.dedup.register_file(await self.storage.resolve_path(asset.storage_key), asset)
+        await self.dedup.register_file(
+            await self.storage.resolve_path(asset.storage_key), asset
+        )
         return IngestResult(ok=True, message="导入成功", asset=asset)
 
     async def review_remote_image(self, image_url: str) -> dict:
@@ -170,13 +180,27 @@ class PluginFacade:
         source_group: str,
         source_user: str,
     ) -> dict:
+        logger.info(
+            f"此刻的心情: 开始处理自动采集 source_group={source_group} "
+            f"source_user={source_user} image_url={image_url}"
+        )
         if image_url in self.inflight_sources:
+            logger.info(f"此刻的心情: 跳过重复自动采集任务 image_url={image_url}")
             return {"success": False, "message": "图片正在处理，已跳过重复任务"}
-        if not await self.can_accept_more_assets(self.plugin_config.get("max_stickers")):
+        if not await self.can_accept_more_assets(
+            self.plugin_config.get("max_stickers")
+        ):
+            logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
             return {"success": False, "message": "当前图片资产数量已达到上限"}
         self.inflight_sources.add(image_url)
         try:
             review_result = await self.review_remote_image(image_url)
+            logger.info(
+                "此刻的心情: 图片审查完成 "
+                f"should_steal={review_result.get('should_steal')} "
+                f"reason={review_result.get('reason')} "
+                f"tags={review_result.get('tags')}"
+            )
             if not review_result.get("should_steal"):
                 return {
                     "success": False,
@@ -188,12 +212,18 @@ class PluginFacade:
                 for tag in review_result.get("tags", [])
                 if str(tag).strip()
             ]
-            normalized_group = normalize_category_name(tags[0] if tags else DEFAULT_CATEGORY)
+            normalized_group = normalize_category_name(
+                tags[0] if tags else DEFAULT_CATEGORY
+            )
             result = await self.save_remote_image(
                 image_url=image_url,
                 group_name=normalized_group,
                 description=str(review_result.get("reason") or "").strip(),
                 source=f"auto_steal_group:{source_group}_user:{source_user}",
+            )
+            logger.info(
+                f"此刻的心情: 自动采集保存完成 ok={result.ok} "
+                f"message={result.message} asset_id={result.asset.asset_id if result.asset else ''}"
             )
             return {
                 "success": result.ok,
@@ -234,15 +264,32 @@ class PluginFacade:
     async def delete_asset(self, asset_id: str) -> DeleteResult:
         asset = await self.storage.delete_asset(asset_id)
         if asset is None:
-            return DeleteResult(ok=False, message=f"未找到 asset_id={asset_id} 的图片资产。")
+            return DeleteResult(
+                ok=False, message=f"未找到 asset_id={asset_id} 的图片资产。"
+            )
         await self.storage.delete_file(asset.storage_key)
         await self.dedup.unregister_asset(asset)
-        return DeleteResult(ok=True, message=f"已删除图片资产: {asset.asset_id}", asset=asset)
+        return DeleteResult(
+            ok=True, message=f"已删除图片资产: {asset.asset_id}", asset=asset
+        )
+
+    def explain_auto_collect_item(self, item) -> tuple[bool, str]:
+        if not self.plugin_config.get("enable_auto_steal", True):
+            return False, "enable_auto_steal=false"
+        if self.plugin_config.get("steal_all_images", False):
+            return True, "steal_all_images=true"
+        matched_attrs = [
+            attr
+            for attr in ("emoji_id", "emoji_package_id", "key")
+            if getattr(item, attr, None)
+        ]
+        if matched_attrs:
+            return True, f"命中特征字段: {', '.join(matched_attrs)}"
+        return False, "steal_all_images=false 且图片不含 emoji_id/emoji_package_id/key"
 
     def should_auto_collect_item(self, item) -> bool:
-        if self.plugin_config.get("steal_all_images", False):
-            return True
-        return any(getattr(item, attr, None) for attr in ("emoji_id", "emoji_package_id", "key"))
+        should_collect, _ = self.explain_auto_collect_item(item)
+        return should_collect
 
     async def maybe_run_cleanup(self) -> None:
         if not self.plugin_config.get("enable_auto_cleanup", True):
@@ -251,14 +298,19 @@ class PluginFacade:
         cleanup_count = int(self.plugin_config.get("cleanup_count", 5) or 5)
         min_keep = int(self.plugin_config.get("min_stickers_to_keep", 0) or 0)
         now = time.time()
-        if self._cleanup_last_run and now - self._cleanup_last_run < interval_hours * 3600:
+        if (
+            self._cleanup_last_run
+            and now - self._cleanup_last_run < interval_hours * 3600
+        ):
             return
         self._cleanup_last_run = now
         total_count = await self.storage.count_assets()
         removable = max(0, total_count - max(min_keep, 0))
         if removable <= 0:
             return
-        to_delete = await self.storage.get_least_used_memes(min(cleanup_count, removable))
+        to_delete = await self.storage.get_least_used_memes(
+            min(cleanup_count, removable)
+        )
         for item in to_delete:
             asset_id = str(item.get("meme_id") or "")
             if asset_id:
@@ -347,9 +399,15 @@ class PluginFacade:
                 except Exception:
                     raw_tags = []
                 tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
-                category = normalize_category_name(tags[0] if tags else file_path.parent.name)
-                storage_key, original_name = await self.storage.import_file(file_path, category)
-                await self.storage.upsert_group(StickerGroup(name=category, description=""))
+                category = normalize_category_name(
+                    tags[0] if tags else file_path.parent.name
+                )
+                storage_key, original_name = await self.storage.import_file(
+                    file_path, category
+                )
+                await self.storage.upsert_group(
+                    StickerGroup(name=category, description="")
+                )
                 asset = await self.storage.add_asset(
                     StickerAssetDraft(
                         group_name=category,
@@ -357,7 +415,9 @@ class PluginFacade:
                         original_name=original_name,
                         mime_hint=file_path.suffix.lower(),
                         description=", ".join(tags),
-                        source=str(row.get("source") or f"legacy_sqlite:{legacy_db.name}"),
+                        source=str(
+                            row.get("source") or f"legacy_sqlite:{legacy_db.name}"
+                        ),
                         labels=tuple(tags) if tags else (category,),
                     )
                 )
@@ -380,4 +440,3 @@ class PluginFacade:
                 logger.warning(f"此刻的心情: 导入旧 SQLite 资产失败: {exc}")
         if imported:
             logger.info(f"此刻的心情: 已从旧 SQLite 导入资产 {imported} 个")
-

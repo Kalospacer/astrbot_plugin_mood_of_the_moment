@@ -41,7 +41,9 @@ def resolve_user_path(raw_path: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
 
 
-def get_allowed_image_roots(extra_roots: Iterable[Path] | None = None) -> tuple[Path, ...]:
+def get_allowed_image_roots(
+    extra_roots: Iterable[Path] | None = None,
+) -> tuple[Path, ...]:
     roots = {
         Path(get_astrbot_data_path()).resolve(),
         Path.cwd().resolve(),

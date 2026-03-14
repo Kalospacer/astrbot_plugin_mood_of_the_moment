@@ -25,7 +25,13 @@ class LegacyManagerBridge:
         self.plugin_config = plugin_config or {}
         self.facade.set_plugin_config(self.plugin_config)
 
-    async def steal_meme(self, image_path: str, category: str, description: str | None = None, save_name: str | None = None) -> str:
+    async def steal_meme(
+        self,
+        image_path: str,
+        category: str,
+        description: str | None = None,
+        save_name: str | None = None,
+    ) -> str:
         raw_path = Path(image_path).expanduser().resolve()
         if not raw_path.exists() or not raw_path.is_file():
             return f"图片不存在或不是文件: {raw_path}"
@@ -33,7 +39,9 @@ class LegacyManagerBridge:
             return f"暂不支持的图片格式: {raw_path.suffix or '无扩展名'}"
         normalized_category = normalize_category_name(category)
         if not normalized_category.strip():
-            return "缺少 category。请先根据分类目录选择一个分类，再调用图片入库工具保存。"
+            return (
+                "缺少 category。请先根据分类目录选择一个分类，再调用图片入库工具保存。"
+            )
         result = await self.facade.ingest_local_file(
             source_path=str(raw_path),
             group_name=normalized_category,
@@ -59,9 +67,20 @@ class LegacyManagerBridge:
     async def review_image(self, image_url: str) -> dict:
         return await self.facade.review_remote_image(image_url)
 
-    async def save_with_tags(self, image_url: str, tags: list, source_group: str, source_user: str, max_stickers: int | None = None) -> dict:
+    async def save_with_tags(
+        self,
+        image_url: str,
+        tags: list,
+        source_group: str,
+        source_user: str,
+        max_stickers: int | None = None,
+    ) -> dict:
         if not await self.facade.can_accept_more_assets(max_stickers):
-            return {"success": False, "meme_id": "", "message": f"当前表情包数量已达到上限 ({max_stickers})"}
+            return {
+                "success": False,
+                "meme_id": "",
+                "message": f"当前表情包数量已达到上限 ({max_stickers})",
+            }
         normalized_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
         normalized_tags = normalized_tags[:4]
         normalized_tags = [tag for tag in normalized_tags if len(tag) <= 10]

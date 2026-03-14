@@ -63,9 +63,15 @@ class ReviewService:
     async def review_image(self, image_url: str) -> dict:
         provider = self._get_provider()
         if provider is None:
-            return {"should_steal": False, "reason": "未找到可用的 LLM 提供商，无法审查图片", "tags": []}
+            return {
+                "should_steal": False,
+                "reason": "未找到可用的 LLM 提供商，无法审查图片",
+                "tags": [],
+            }
         try:
-            response = await provider.text_chat(prompt=self._get_review_prompt(), image_urls=[image_url])
+            response = await provider.text_chat(
+                prompt=self._get_review_prompt(), image_urls=[image_url]
+            )
             if response is None or not hasattr(response, "completion_text"):
                 return {"should_steal": False, "reason": "LLM 返回结果为空", "tags": []}
             result_text = response.completion_text.strip()
@@ -75,7 +81,9 @@ class ReviewService:
                     result = json.loads(json_match.group())
                     tags = result.get("tags", [])
                     return {
-                        "should_steal": self._parse_should_steal(result.get("should_steal", False)),
+                        "should_steal": self._parse_should_steal(
+                            result.get("should_steal", False)
+                        ),
                         "reason": str(result.get("reason", "未知")),
                         "tags": list(tags) if isinstance(tags, list) else [],
                     }
