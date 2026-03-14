@@ -10,8 +10,6 @@ class PluginPaths:
     data_dir: Path
     stickers_dir: Path
     metadata_db: Path
-    legacy_metadata_db: Path
-    legacy_index_file: Path
     default_dir: Path
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 
@@ -34,14 +34,12 @@ class MoodOfTheMomentPlugin(Star):
         self.context = context
         self.config = config or {}
         self.plugin_dir = Path(__file__).resolve().parent
-        self.data_dir = StarTools.get_data_dir() / PLUGIN_PACKAGE_NAME
+        self.data_dir = StarTools.get_data_dir()
         self.paths = PluginPaths(
             plugin_dir=self.plugin_dir,
             data_dir=self.data_dir,
             stickers_dir=self.data_dir / "stickers",
             metadata_db=self.data_dir / "stickers.sqlite3",
-            legacy_metadata_db=self.data_dir / "legacy_memes.sqlite3",
-            legacy_index_file=self.data_dir / "legacy_index.json",
             default_dir=self.plugin_dir / "default",
         )
         self.facade = PluginFacade(paths=self.paths, context=context, plugin_config=self.config)
@@ -50,9 +48,23 @@ class MoodOfTheMomentPlugin(Star):
         StarTools.unregister_llm_tool(STEAL_TOOL_NAME)
         self.context.add_llm_tools(self.steal_tool)
 
+    def _finalize_task(self, task: asyncio.Task) -> None:
+        self._auto_collect_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME}: 读取后台任务结果失败: {exc}")
+            return
+        if exc is not None:
+            logger.error(f"{PLUGIN_NAME}: 后台任务执行失败: {exc}", exc_info=exc)
+
     def _track_task(self, task: asyncio.Task) -> None:
         self._auto_collect_tasks.add(task)
-        task.add_done_callback(self._auto_collect_tasks.discard)
+        task.add_done_callback(self._finalize_task)
 
     async def initialize(self):
         await self.facade.startup()
@@ -88,7 +100,7 @@ class MoodOfTheMomentPlugin(Star):
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
         _ = event
-        _append_summary(req, self.facade.build_llm_summary())
+        _append_summary(req, await self.facade.build_llm_summary())
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -99,13 +111,14 @@ class MoodOfTheMomentPlugin(Star):
         for item in result.chain:
             text = getattr(item, "text", None)
             if isinstance(text, str):
-                decorated = await self.facade.decorate_text(text=text, scope_key=event.unified_msg_origin)
+                decorated = await self.facade.decorate_text(
+                    text=text,
+                    scope_key=event.unified_msg_origin,
+                )
                 for segment in decorated.segments:
                     if segment.kind == "image":
                         new_chain.append(Image.fromFileSystem(segment.value))
                     else:
-                        from astrbot.api.message_components import Plain
-
                         new_chain.append(Plain(segment.value))
             else:
                 new_chain.append(item)
@@ -114,9 +127,14 @@ class MoodOfTheMomentPlugin(Star):
     @filter.command("smile_check")
     async def check_meme(self, event: AstrMessageEvent, limit: int = 5) -> None:
         limit = max(1, min(limit, 20))
-        items = await self.facade.inspect_recent(scope_key=event.unified_msg_origin, limit=limit)
+        items = await self.facade.inspect_recent(
+            scope_key=event.unified_msg_origin,
+            limit=limit,
+        )
         if not items:
-            await event.send(MessageChain().message("当前会话里还没有 cleanroom foundation 发出的图片记录。"))
+            await event.send(
+                MessageChain().message("当前会话里还没有 cleanroom foundation 发出的图片记录。")
+            )
             return
         lines = [f"当前会话最近 {len(items)} 条图片资产记录："]
         for index, item in enumerate(items, start=1):

@@ -86,40 +86,40 @@ class LegacyStorageFacade:
         self.facade = facade
 
     async def get_catalog_stickers_data(self) -> dict[str, str]:
-        return self.facade.storage.get_catalog_stickers_data()
+        return await self.facade.storage.get_catalog_stickers_data()
 
     async def get_available_stickers_data(self) -> dict[str, str]:
-        return self.facade.storage.get_available_stickers_data()
+        return await self.facade.storage.get_available_stickers_data()
 
     async def get_catalog_description(self, category: str) -> str | None:
-        return self.facade.storage.get_catalog_description(category)
+        return await self.facade.storage.get_catalog_description(category)
 
     async def has_sticker_assets(self, category: str) -> bool:
-        return self.facade.storage.has_sticker_assets(category)
+        return await self.facade.storage.has_sticker_assets(category)
 
     async def get_sticker_count(self) -> int:
-        return self.facade.storage.get_sticker_count()
+        return await self.facade.storage.get_sticker_count()
 
     async def get_all_memes(self) -> list[dict]:
-        return self.facade.storage.get_all_memes()
+        return await self.facade.storage.get_all_memes()
 
     async def get_meme_by_id(self, asset_id: str) -> dict | None:
-        return self.facade.storage.get_meme_by_id(asset_id)
+        return await self.facade.storage.get_meme_by_id(asset_id)
 
     async def get_meme_by_file_path(self, file_path: str | Path) -> dict | None:
-        return self.facade.storage.get_meme_by_file_path(file_path)
+        return await self.facade.storage.get_meme_by_file_path(file_path)
 
     async def get_random_sticker_path(self, category: str) -> str | None:
-        return self.facade.storage.get_random_sticker_path(category)
+        return await self.facade.storage.get_random_sticker_path(category)
 
     async def delete_meme(self, asset_id: str) -> bool:
-        return self.facade.storage.delete_meme(asset_id)
+        return await self.facade.storage.delete_meme(asset_id)
 
     async def iter_all_sticker_files(self) -> list[Path]:
-        return self.facade.storage.iter_all_sticker_files()
+        return await self.facade.storage.iter_all_sticker_files()
 
     async def get_least_used_memes(self, count: int) -> list[dict]:
-        return self.facade.storage.get_least_used_memes(count)
+        return await self.facade.storage.get_least_used_memes(count)
 
     async def get_usage_stats(self) -> dict:
-        return self.facade.storage.get_usage_stats()
+        return await self.facade.storage.get_usage_stats()

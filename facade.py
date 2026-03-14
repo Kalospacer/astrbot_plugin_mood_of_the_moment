@@ -6,10 +6,19 @@ from pathlib import Path
 
 from astrbot.api import logger
 
-from .constants import DEFAULT_CATEGORY, DEFAULT_CATEGORY_DESCRIPTION, SUPPORTED_IMAGE_SUFFIXES
+from .constants import DEFAULT_CATEGORY, SUPPORTED_IMAGE_SUFFIXES
 from .dedup import DHashDedupService
 from .downloader import RemoteImageDownloader
-from .models import DeleteResult, DecoratedContent, DecoratedSegment, IngestResult, PluginPaths, StickerAssetDraft, StickerGroup, StickerUsageEvent
+from .models import (
+    DeleteResult,
+    DecoratedContent,
+    IngestResult,
+    PluginPaths,
+    StickerAssetDraft,
+    StickerGroup,
+    StickerUsageEvent,
+)
+
 from .render import StickerRenderer
 from .review import ReviewService
 from .storage import StickerStorage
@@ -33,9 +42,13 @@ class PluginFacade:
         self.downloader = RemoteImageDownloader()
         self.renderer = StickerRenderer(
             storage=self.storage,
-            max_stickers_per_message=int(self.plugin_config.get("max_stickers_per_message", 1) or 1),
+            max_stickers_per_message=int(
+                self.plugin_config.get("max_stickers_per_message", 1) or 1
+            ),
         )
-        self.allowed_image_roots = get_allowed_image_roots(extra_roots=(self.paths.plugin_dir, self.paths.data_dir))
+        self.allowed_image_roots = get_allowed_image_roots(
+            extra_roots=(self.paths.plugin_dir, self.paths.data_dir)
+        )
         self.inflight_sources: set[str] = set()
         self._cleanup_last_run = 0.0
 
@@ -46,37 +59,57 @@ class PluginFacade:
     def set_plugin_config(self, plugin_config: dict | None) -> None:
         self.plugin_config = plugin_config or {}
         self.review.set_plugin_config(self.plugin_config)
-        self.renderer.max_stickers_per_message = max(0, int(self.plugin_config.get("max_stickers_per_message", 1) or 1))
+        self.renderer.max_stickers_per_message = max(
+            0, int(self.plugin_config.get("max_stickers_per_message", 1) or 1)
+        )
 
     async def startup(self) -> None:
-        self.storage.initialize()
-        self.dedup.initialize()
-        self._import_default_catalog()
+        await self.storage.initialize()
+        await self.dedup.initialize()
+        await self._import_default_catalog()
+        await self._import_legacy_sqlite_if_present()
 
     async def shutdown(self) -> None:
-        self.storage.close()
+        await self.storage.close()
 
-    def build_llm_summary(self) -> str:
-        return self.renderer.build_prompt_catalog()
+    async def build_llm_summary(self) -> str:
+        return await self.renderer.build_prompt_catalog()
 
     async def decorate_text(self, text: str, scope_key: str) -> DecoratedContent:
         return await self.renderer.decorate_text(text=text, scope_key=scope_key)
 
-    async def ingest_local_file(self, source_path: str, group_name: str, description: str = "", preferred_name: str | None = None) -> IngestResult:
+    async def ingest_local_file(
+        self,
+        source_path: str,
+        group_name: str,
+        description: str = "",
+        preferred_name: str | None = None,
+    ) -> IngestResult:
         resolved = resolve_user_path(source_path)
         if not resolved.exists() or not resolved.is_file():
             return IngestResult(ok=False, message=f"图片不存在或不是文件: {resolved}")
         if resolved.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
-            return IngestResult(ok=False, message=f"不支持的图片格式: {resolved.suffix or '无扩展名'}")
+            return IngestResult(
+                ok=False,
+                message=f"不支持的图片格式: {resolved.suffix or '无扩展名'}",
+            )
         if not is_path_within_roots(resolved, self.allowed_image_roots):
             return IngestResult(ok=False, message=f"图片路径超出允许范围: {resolved}")
         normalized_group = normalize_category_name(group_name)
-        duplicate = self.dedup.find_similar_duplicate(resolved)
+        duplicate = await self.dedup.find_similar_duplicate(resolved)
         if duplicate is not None:
-            return IngestResult(ok=False, message=f"检测到重复资产: {duplicate.asset_id}", duplicate_of=duplicate.asset_id)
-        storage_key, original_name = self.storage.import_file(resolved, normalized_group, preferred_name)
-        self.storage.upsert_group(StickerGroup(name=normalized_group, description=(description or "").strip()))
-        asset = self.storage.add_asset(
+            return IngestResult(
+                ok=False,
+                message=f"检测到重复资产: {duplicate.asset_id}",
+                duplicate_of=duplicate.asset_id,
+            )
+        storage_key, original_name = await self.storage.import_file(
+            resolved, normalized_group, preferred_name
+        )
+        await self.storage.upsert_group(
+            StickerGroup(name=normalized_group, description=(description or "").strip())
+        )
+        asset = await self.storage.add_asset(
             StickerAssetDraft(
                 group_name=normalized_group,
                 storage_key=storage_key,
@@ -87,31 +120,40 @@ class PluginFacade:
                 labels=(normalize_tag_display_name(group_name),),
             )
         )
-        self.dedup.register_file(self.storage.resolve_path(asset.storage_key), asset)
+        await self.dedup.register_file(await self.storage.resolve_path(asset.storage_key), asset)
         return IngestResult(ok=True, message="导入成功", asset=asset)
 
     async def review_remote_image(self, image_url: str) -> dict:
         return await self.review.review_image(image_url)
 
-    async def save_remote_image(self, image_url: str, group_name: str, description: str = "", preferred_name: str | None = None, source: str = "remote") -> IngestResult:
+    async def save_remote_image(
+        self,
+        image_url: str,
+        group_name: str,
+        description: str = "",
+        preferred_name: str | None = None,
+        source: str = "remote",
+    ) -> IngestResult:
         temp_file = await self.downloader.download(image_url)
         if temp_file is None:
             return IngestResult(ok=False, message="下载图片失败")
         try:
-            result = await self.ingest_local_file(str(temp_file), group_name, description, preferred_name)
+            result = await self.ingest_local_file(
+                str(temp_file), group_name, description, preferred_name
+            )
             if result.ok and result.asset is not None and source != "manual":
-                self.storage._get_connection().execute(
-                    "UPDATE sticker_assets SET source = ? WHERE asset_id = ?",
-                    (source, result.asset.asset_id),
-                )
-                self.storage._get_connection().commit()
+                await self.storage.update_asset_source(result.asset.asset_id, source)
                 result.asset.source = source
             return result
         finally:
             self.downloader.cleanup(temp_file)
 
     async def can_accept_more_assets(self, max_stickers: int | None = None) -> bool:
-        limit = max_stickers if max_stickers is not None else self.plugin_config.get("max_stickers")
+        limit = (
+            max_stickers
+            if max_stickers is not None
+            else self.plugin_config.get("max_stickers")
+        )
         if limit in (None, ""):
             return True
         try:
@@ -120,9 +162,14 @@ class PluginFacade:
             return True
         if limit_value <= 0:
             return True
-        return self.storage.count_assets() < limit_value
+        return await self.storage.count_assets() < limit_value
 
-    async def maybe_auto_collect_image(self, image_url: str, source_group: str, source_user: str) -> dict:
+    async def maybe_auto_collect_image(
+        self,
+        image_url: str,
+        source_group: str,
+        source_user: str,
+    ) -> dict:
         if image_url in self.inflight_sources:
             return {"success": False, "message": "图片正在处理，已跳过重复任务"}
         if not await self.can_accept_more_assets(self.plugin_config.get("max_stickers")):
@@ -136,7 +183,11 @@ class PluginFacade:
                     "message": str(review_result.get("reason") or "LLM 审查未通过"),
                     "review": review_result,
                 }
-            tags = [str(tag).strip() for tag in review_result.get("tags", []) if str(tag).strip()]
+            tags = [
+                str(tag).strip()
+                for tag in review_result.get("tags", [])
+                if str(tag).strip()
+            ]
             normalized_group = normalize_category_name(tags[0] if tags else DEFAULT_CATEGORY)
             result = await self.save_remote_image(
                 image_url=image_url,
@@ -157,13 +208,13 @@ class PluginFacade:
             self.inflight_sources.discard(image_url)
 
     async def inspect_recent(self, scope_key: str, limit: int = 5):
-        usage_events = self.storage.list_recent_usage(scope_key, limit)
+        usage_events = await self.storage.list_recent_usage(scope_key, limit)
         results = []
         seen_asset_ids: set[str] = set()
         for event in usage_events:
             if event.asset_id in seen_asset_ids:
                 continue
-            asset = self.storage.get_asset(event.asset_id)
+            asset = await self.storage.get_asset(event.asset_id)
             if asset is None:
                 continue
             results.append(
@@ -181,11 +232,11 @@ class PluginFacade:
         return results
 
     async def delete_asset(self, asset_id: str) -> DeleteResult:
-        asset = self.storage.delete_asset(asset_id)
+        asset = await self.storage.delete_asset(asset_id)
         if asset is None:
             return DeleteResult(ok=False, message=f"未找到 asset_id={asset_id} 的图片资产。")
-        self.storage.delete_file(asset.storage_key)
-        self.dedup.unregister_asset(asset)
+        await self.storage.delete_file(asset.storage_key)
+        await self.dedup.unregister_asset(asset)
         return DeleteResult(ok=True, message=f"已删除图片资产: {asset.asset_id}", asset=asset)
 
     def should_auto_collect_item(self, item) -> bool:
@@ -203,17 +254,17 @@ class PluginFacade:
         if self._cleanup_last_run and now - self._cleanup_last_run < interval_hours * 3600:
             return
         self._cleanup_last_run = now
-        total_count = self.storage.count_assets()
+        total_count = await self.storage.count_assets()
         removable = max(0, total_count - max(min_keep, 0))
         if removable <= 0:
             return
-        to_delete = self.storage.get_least_used_memes(min(cleanup_count, removable))
+        to_delete = await self.storage.get_least_used_memes(min(cleanup_count, removable))
         for item in to_delete:
             asset_id = str(item.get("meme_id") or "")
             if asset_id:
                 await self.delete_asset(asset_id)
 
-    def _import_default_catalog(self) -> None:
+    async def _import_default_catalog(self) -> None:
         default_json = self.paths.default_dir / "memes_data.json"
         if default_json.exists():
             try:
@@ -221,7 +272,112 @@ class PluginFacade:
                 if isinstance(raw_data, dict):
                     for category, description in raw_data.items():
                         normalized = normalize_category_name(category)
-                        self.storage.upsert_group(StickerGroup(name=normalized, description=str(description or "").strip()))
+                        await self.storage.upsert_group(
+                            StickerGroup(
+                                name=normalized,
+                                description=str(description or "").strip(),
+                            )
+                        )
             except Exception as exc:
                 logger.warning(f"此刻的心情: 读取默认分类描述失败: {exc}")
+
+    async def _import_legacy_sqlite_if_present(self) -> None:
+        if await self.storage.count_assets() > 0:
+            return
+        legacy_root = self.paths.plugin_dir.parent / "astrbot_plugin_angel_smile"
+        candidate_dbs = [
+            legacy_root / "data" / "memes.db",
+            legacy_root / "data" / "cleanroom" / "assets.sqlite3",
+        ]
+        legacy_db = next((path for path in candidate_dbs if path.exists()), None)
+        if legacy_db is None:
+            return
+        rows: list[dict[str, object]] = []
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(str(legacy_db))
+            conn.row_factory = sqlite3.Row
+            table_names = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "memes" in table_names:
+                rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT meme_id, file_path, tags, source, usage_count, added_time FROM memes"
+                    ).fetchall()
+                ]
+            elif "assets" in table_names:
+                rows = [
+                    {
+                        "meme_id": row["asset_id"],
+                        "file_path": row["storage_key"],
+                        "tags": row["labels_json"],
+                        "source": row["source"],
+                        "usage_count": row["usage_count"],
+                        "added_time": row["created_at"],
+                    }
+                    for row in conn.execute(
+                        "SELECT asset_id, storage_key, labels_json, source, usage_count, created_at FROM assets"
+                    ).fetchall()
+                ]
+            conn.close()
+        except Exception as exc:
+            logger.warning(f"此刻的心情: 读取旧 SQLite 数据失败: {exc}")
+            return
+        imported = 0
+        for row in rows:
+            try:
+                raw_file_path = Path(str(row.get("file_path") or ""))
+                if raw_file_path.is_absolute():
+                    file_path = raw_file_path.resolve()
+                else:
+                    file_path = (legacy_root / raw_file_path).resolve()
+                if not file_path.exists() or not file_path.is_file():
+                    continue
+                duplicate = await self.dedup.find_similar_duplicate(file_path)
+                if duplicate is not None:
+                    continue
+                try:
+                    raw_tags = json.loads(str(row.get("tags") or "[]"))
+                except Exception:
+                    raw_tags = []
+                tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+                category = normalize_category_name(tags[0] if tags else file_path.parent.name)
+                storage_key, original_name = await self.storage.import_file(file_path, category)
+                await self.storage.upsert_group(StickerGroup(name=category, description=""))
+                asset = await self.storage.add_asset(
+                    StickerAssetDraft(
+                        group_name=category,
+                        storage_key=storage_key,
+                        original_name=original_name,
+                        mime_hint=file_path.suffix.lower(),
+                        description=", ".join(tags),
+                        source=str(row.get("source") or f"legacy_sqlite:{legacy_db.name}"),
+                        labels=tuple(tags) if tags else (category,),
+                    )
+                )
+                usage_count = int(row.get("usage_count") or 0)
+                added_time = float(row.get("added_time") or time.time())
+                for _ in range(max(usage_count, 1)):
+                    await self.storage.record_usage(
+                        StickerUsageEvent(
+                            asset_id=asset.asset_id,
+                            scope_key="legacy-import",
+                            created_at=added_time,
+                        )
+                    )
+                await self.dedup.register_file(
+                    await self.storage.resolve_path(asset.storage_key),
+                    asset,
+                )
+                imported += 1
+            except Exception as exc:
+                logger.warning(f"此刻的心情: 导入旧 SQLite 资产失败: {exc}")
+        if imported:
+            logger.info(f"此刻的心情: 已从旧 SQLite 导入资产 {imported} 个")
 
