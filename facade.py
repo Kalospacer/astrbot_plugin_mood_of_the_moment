@@ -50,11 +50,12 @@ class PluginFacade:
             ),
         )
         self.allowed_image_roots = get_allowed_image_roots(
+            data_dir=self.paths.data_dir,
             extra_roots=(
                 self.paths.plugin_dir,
                 self.paths.data_dir,
                 self.downloader.temp_dir,
-            )
+            ),
         )
         self.inflight_sources: set[str] = set()
         self._inflight_lock = asyncio.Lock()
