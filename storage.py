@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import shutil
 import sqlite3
@@ -104,7 +105,7 @@ class StickerStorage:
                 conn.commit()
 
     def _build_asset_id(self, group_name: str) -> str:
-        return f"{group_name}-{int(time.time() * 1000)}"
+        return f"{group_name}-{int(time.time() * 1000)}-{os.urandom(4).hex()}"
 
     def _labels_to_json(self, labels: tuple[str, ...]) -> str:
         return json.dumps([label for label in labels if label], ensure_ascii=False)

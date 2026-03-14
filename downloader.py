@@ -12,6 +12,8 @@ from .constants import SUPPORTED_IMAGE_SUFFIXES
 
 
 class RemoteImageDownloader:
+    max_download_bytes = 10 * 1024 * 1024
+
     @property
     def temp_dir(self) -> Path:
         return Path(tempfile.gettempdir()) / "mood_of_the_moment"
@@ -33,11 +35,25 @@ class RemoteImageDownloader:
                             f"此刻的心情: 下载图片失败，状态码: {response.status}"
                         )
                         return None
-                    content = await response.read()
+                    content_length = response.content_length
+                    if (
+                        content_length is not None
+                        and content_length > self.max_download_bytes
+                    ):
+                        logger.warning(
+                            f"此刻的心情: 下载图片过大，已拒绝: {content_length} bytes"
+                        )
+                        return None
+                    content = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        content.extend(chunk)
+                        if len(content) > self.max_download_bytes:
+                            logger.warning("此刻的心情: 下载图片超过大小上限，已中止")
+                            return None
                     if not content or len(content) < 100:
                         logger.warning("此刻的心情: 下载的图片内容过小或为空")
                         return None
-                    temp_file.write_bytes(content)
+                    temp_file.write_bytes(bytes(content))
             return temp_file
         except aiohttp.ClientError as exc:
             logger.error(f"此刻的心情: 下载图片网络错误: {exc}")

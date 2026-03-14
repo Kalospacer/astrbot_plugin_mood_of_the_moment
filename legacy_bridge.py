@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from .constants import SUPPORTED_IMAGE_SUFFIXES
-from .utils import normalize_category_name
+from .utils import normalize_category_name, resolve_user_path
 
 
 class LegacyManagerBridge:
@@ -32,7 +32,7 @@ class LegacyManagerBridge:
         description: str | None = None,
         save_name: str | None = None,
     ) -> str:
-        raw_path = Path(image_path).expanduser().resolve()
+        raw_path = resolve_user_path(image_path)
         if not raw_path.exists() or not raw_path.is_file():
             return f"图片不存在或不是文件: {raw_path}"
         if raw_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:

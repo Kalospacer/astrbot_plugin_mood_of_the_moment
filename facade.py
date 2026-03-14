@@ -165,11 +165,17 @@ class PluginFacade:
                     name=normalized_group, description=(description or "").strip()
                 )
             )
-            normalized_labels = tuple(
-                normalize_tag_display_name(label)
-                for label in (labels or (group_name,))
-                if normalize_tag_display_name(label)
-            ) or (normalize_tag_display_name(group_name),)
+            normalized_labels_list: list[str] = []
+            for raw_label in labels or (group_name,):
+                stripped_label = (raw_label or "").strip()
+                if not stripped_label:
+                    continue
+                normalized_label = normalize_tag_display_name(stripped_label)
+                if normalized_label and normalized_label not in normalized_labels_list:
+                    normalized_labels_list.append(normalized_label)
+            normalized_labels = tuple(normalized_labels_list) or (
+                normalize_tag_display_name(group_name),
+            )
             asset = await self.storage.add_asset(
                 StickerAssetDraft(
                     group_name=normalized_group,

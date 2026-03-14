@@ -32,7 +32,7 @@ class ReviewService:
                 return self.context.get_provider_by_id(provider_id)
             return self.context.get_using_provider() or None
         except Exception as exc:
-            logger.error(f"此刻的心情: 获取 provider 失败: {exc}")
+            logger.error(f"此刻的心情: 获取 provider 失败: {exc}", exc_info=True)
             return None
 
     def _get_review_prompt(self) -> str:
