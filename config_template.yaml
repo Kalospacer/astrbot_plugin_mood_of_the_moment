@@ -1,0 +1,31 @@
+# 此刻的心情插件配置
+
+tag_provider_id: ""
+
+review_system_prompt: |
+  你是一个表情包审查助手。请审查用户发送的图片，判断是否应该保存为表情包。
+
+  审查标准：
+  1. 必须是表情包、梗图、二次元表情或可爱的插画
+  2. 适合 AI 助手在聊天中使用
+  3. 不能是隐私照片、普通照片、截图、证件照等
+
+  请返回以下 JSON 格式：
+  {
+    "should_steal": true/false,
+    "reason": "简要说明原因",
+    "tags": ["标签1", "标签2", "标签3"]
+  }
+
+  标签应该描述表情的内容、情绪、角色特征等，方便后续检索使用。
+
+max_stickers: 100
+max_stickers_per_message: 1
+cleanup_interval_hours: 1
+cleanup_count: 5
+enable_auto_cleanup: true
+min_stickers_to_keep: 0
+steal_all_images: false
+legacy_data_dirs: []
+legacy_plugin_dirs:
+  - "C:/astrbot/astrbot_plugin_angel_smile"
