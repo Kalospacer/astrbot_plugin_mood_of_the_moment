@@ -134,7 +134,7 @@ class MoodOfTheMomentPlugin(Star):
                 new_chain.append(item)
         result.chain = new_chain
 
-    @filter.command("smile_check")
+    @filter.command("mood_check")
     async def check_meme(self, event: AstrMessageEvent, limit: int = 5) -> None:
         limit = max(1, min(limit, 20))
         items = await self.facade.inspect_recent(
@@ -156,14 +156,14 @@ class MoodOfTheMomentPlugin(Star):
         await event.send(MessageChain().message("\n".join(lines)))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("smile_delete")
+    @filter.command("mood_delete")
     async def delete_asset_command(
         self, event: AstrMessageEvent, asset_id: str = ""
     ) -> None:
         normalized_asset_id = asset_id.strip()
         if not normalized_asset_id:
             await event.send(
-                MessageChain().message("请使用 smile_delete <asset_id> 删除图片资产。")
+                MessageChain().message("请使用 mood_delete <asset_id> 删除图片资产。")
             )
             return
         result = await self.facade.delete_asset(normalized_asset_id)
