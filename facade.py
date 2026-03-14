@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from astrbot.api import logger
+from PIL import Image, UnidentifiedImageError
 
 from .constants import DEFAULT_CATEGORY, SUPPORTED_IMAGE_SUFFIXES
 from .dedup import DHashDedupService
@@ -47,9 +50,16 @@ class PluginFacade:
             ),
         )
         self.allowed_image_roots = get_allowed_image_roots(
-            extra_roots=(self.paths.plugin_dir, self.paths.data_dir)
+            data_dir=self.paths.data_dir,
+            extra_roots=(
+                self.paths.plugin_dir,
+                self.paths.data_dir,
+                self.downloader.temp_dir,
+            ),
         )
         self.inflight_sources: set[str] = set()
+        self._inflight_lock = asyncio.Lock()
+        self._ingest_lock = asyncio.Lock()
         self._cleanup_last_run = 0.0
 
     def set_context(self, context) -> None:
@@ -86,12 +96,77 @@ class PluginFacade:
     async def decorate_text(self, text: str, scope_key: str) -> DecoratedContent:
         return await self.renderer.decorate_text(text=text, scope_key=scope_key)
 
+    @staticmethod
+    def _is_remote_image_source(image_source: str) -> bool:
+        parsed = urlparse(image_source)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _mask_identifier(value: str) -> str:
+        text = value.strip()
+        if len(text) <= 4:
+            return text or "-"
+        return f"{text[:2]}***{text[-2:]}"
+
+    def summarize_image_source(self, image_source: str) -> str:
+        if self._is_remote_image_source(image_source):
+            parsed = urlparse(image_source)
+            path = parsed.path or "/"
+            return f"{parsed.scheme}://{parsed.netloc}{path}"
+        path = Path(image_source)
+        return f"local:{path.name or '[unknown]'}"
+
+    @staticmethod
+    def extract_image_segment_payloads(raw_message) -> list[dict]:
+        segments = getattr(raw_message, "message", None)
+        if segments is None and isinstance(raw_message, dict):
+            segments = raw_message.get("message")
+        if not isinstance(segments, list):
+            return []
+        payloads: list[dict] = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            if segment.get("type") != "image":
+                continue
+            data = segment.get("data")
+            if isinstance(data, dict):
+                payloads.append(data)
+        return payloads
+
+    @staticmethod
+    def get_image_source(item, raw_image_data: dict | None = None) -> str:
+        if raw_image_data:
+            for key in ("url", "path", "file"):
+                value = str(raw_image_data.get(key) or "").strip()
+                if value:
+                    return value
+        for key in ("url", "path", "file"):
+            value = str(getattr(item, key, "") or "").strip()
+            if value:
+                return value
+        return ""
+
+    async def _validate_image_file(self, image_path: Path) -> bool:
+        return await asyncio.to_thread(self._validate_image_file_sync, image_path)
+
+    @staticmethod
+    def _validate_image_file_sync(image_path: Path) -> bool:
+        try:
+            with Image.open(image_path) as image:
+                image.verify()
+            return True
+        except (OSError, UnidentifiedImageError):
+            return False
+
     async def ingest_local_file(
         self,
         source_path: str,
         group_name: str,
         description: str = "",
         preferred_name: str | None = None,
+        labels: tuple[str, ...] | None = None,
+        source: str = "manual",
     ) -> IngestResult:
         resolved = resolve_user_path(source_path)
         if not resolved.exists() or not resolved.is_file():
@@ -103,35 +178,51 @@ class PluginFacade:
             )
         if not is_path_within_roots(resolved, self.allowed_image_roots):
             return IngestResult(ok=False, message=f"图片路径超出允许范围: {resolved}")
+        if not await self._validate_image_file(resolved):
+            return IngestResult(ok=False, message=f"图片内容无效或已损坏: {resolved}")
         normalized_group = normalize_category_name(group_name)
-        duplicate = await self.dedup.find_similar_duplicate(resolved)
-        if duplicate is not None:
-            return IngestResult(
-                ok=False,
-                message=f"检测到重复资产: {duplicate.asset_id}",
-                duplicate_of=duplicate.asset_id,
+        async with self._ingest_lock:
+            duplicate = await self.dedup.find_similar_duplicate(resolved)
+            if duplicate is not None:
+                return IngestResult(
+                    ok=False,
+                    message=f"检测到重复资产: {duplicate.asset_id}",
+                    duplicate_of=duplicate.asset_id,
+                )
+            storage_key, original_name = await self.storage.import_file(
+                resolved, normalized_group, preferred_name
             )
-        storage_key, original_name = await self.storage.import_file(
-            resolved, normalized_group, preferred_name
-        )
-        await self.storage.upsert_group(
-            StickerGroup(name=normalized_group, description=(description or "").strip())
-        )
-        asset = await self.storage.add_asset(
-            StickerAssetDraft(
-                group_name=normalized_group,
-                storage_key=storage_key,
-                original_name=original_name,
-                mime_hint=resolved.suffix.lower(),
-                description=(description or "").strip(),
-                source="manual",
-                labels=(normalize_tag_display_name(group_name),),
+            await self.storage.upsert_group(
+                StickerGroup(
+                    name=normalized_group, description=(description or "").strip()
+                )
             )
-        )
-        await self.dedup.register_file(
-            await self.storage.resolve_path(asset.storage_key), asset
-        )
-        return IngestResult(ok=True, message="导入成功", asset=asset)
+            normalized_labels_list: list[str] = []
+            for raw_label in labels or (group_name,):
+                stripped_label = (raw_label or "").strip()
+                if not stripped_label:
+                    continue
+                normalized_label = normalize_tag_display_name(stripped_label)
+                if normalized_label and normalized_label not in normalized_labels_list:
+                    normalized_labels_list.append(normalized_label)
+            normalized_labels = tuple(normalized_labels_list) or (
+                normalize_tag_display_name(group_name),
+            )
+            asset = await self.storage.add_asset(
+                StickerAssetDraft(
+                    group_name=normalized_group,
+                    storage_key=storage_key,
+                    original_name=original_name,
+                    mime_hint=resolved.suffix.lower(),
+                    description=(description or "").strip(),
+                    source=source,
+                    labels=normalized_labels,
+                )
+            )
+            await self.dedup.register_file(
+                await self.storage.resolve_path(asset.storage_key), asset
+            )
+            return IngestResult(ok=True, message="导入成功", asset=asset)
 
     async def review_remote_image(self, image_url: str) -> dict:
         return await self.review.review_image(image_url)
@@ -143,17 +234,20 @@ class PluginFacade:
         description: str = "",
         preferred_name: str | None = None,
         source: str = "remote",
+        labels: tuple[str, ...] | None = None,
     ) -> IngestResult:
         temp_file = await self.downloader.download(image_url)
         if temp_file is None:
             return IngestResult(ok=False, message="下载图片失败")
         try:
             result = await self.ingest_local_file(
-                str(temp_file), group_name, description, preferred_name
+                str(temp_file),
+                group_name,
+                description,
+                preferred_name,
+                labels=labels,
+                source=source,
             )
-            if result.ok and result.asset is not None and source != "manual":
-                await self.storage.update_asset_source(result.asset.asset_id, source)
-                result.asset.source = source
             return result
         finally:
             self.downloader.cleanup(temp_file)
@@ -180,19 +274,32 @@ class PluginFacade:
         source_group: str,
         source_user: str,
     ) -> dict:
+        sanitized_source = self.summarize_image_source(image_url)
         logger.info(
             f"此刻的心情: 开始处理自动采集 source_group={source_group} "
-            f"source_user={source_user} image_url={image_url}"
+            f"source_user={self._mask_identifier(source_user)} image_url={sanitized_source}"
         )
-        if image_url in self.inflight_sources:
-            logger.info(f"此刻的心情: 跳过重复自动采集任务 image_url={image_url}")
-            return {"success": False, "message": "图片正在处理，已跳过重复任务"}
+        async with self._inflight_lock:
+            if image_url in self.inflight_sources:
+                logger.info(
+                    f"此刻的心情: 跳过重复自动采集任务 image_url={sanitized_source}"
+                )
+                return {"success": False, "message": "图片正在处理，已跳过重复任务"}
+            self.inflight_sources.add(image_url)
+        if not self._is_remote_image_source(image_url):
+            logger.warning(
+                f"此刻的心情: 自动采集仅支持远程图片源，已跳过 image_url={sanitized_source}"
+            )
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
+            return {"success": False, "message": "自动采集仅支持远程图片 URL"}
         if not await self.can_accept_more_assets(
             self.plugin_config.get("max_stickers")
         ):
             logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "当前图片资产数量已达到上限"}
-        self.inflight_sources.add(image_url)
         try:
             review_result = await self.review_remote_image(image_url)
             logger.info(
@@ -220,6 +327,7 @@ class PluginFacade:
                 group_name=normalized_group,
                 description=str(review_result.get("reason") or "").strip(),
                 source=f"auto_steal_group:{source_group}_user:{source_user}",
+                labels=tuple(tags) if tags else None,
             )
             logger.info(
                 f"此刻的心情: 自动采集保存完成 ok={result.ok} "
@@ -235,7 +343,8 @@ class PluginFacade:
             logger.error(f"此刻的心情: 自动采集失败: {exc}", exc_info=True)
             return {"success": False, "message": f"自动采集失败: {exc}"}
         finally:
-            self.inflight_sources.discard(image_url)
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
 
     async def inspect_recent(self, scope_key: str, limit: int = 5):
         usage_events = await self.storage.list_recent_usage(scope_key, limit)
@@ -273,16 +382,26 @@ class PluginFacade:
             ok=True, message=f"已删除图片资产: {asset.asset_id}", asset=asset
         )
 
-    def explain_auto_collect_item(self, item) -> tuple[bool, str]:
+    def explain_auto_collect_item(
+        self, item, raw_image_data: dict | None = None
+    ) -> tuple[bool, str]:
         if not self.plugin_config.get("enable_auto_steal", True):
             return False, "enable_auto_steal=false"
         if self.plugin_config.get("steal_all_images", False):
             return True, "steal_all_images=true"
-        matched_attrs = [
-            attr
-            for attr in ("emoji_id", "emoji_package_id", "key")
-            if getattr(item, attr, None)
-        ]
+        matched_attrs: list[str] = []
+        if raw_image_data:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if raw_image_data.get(attr)
+            )
+        if not matched_attrs:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if getattr(item, attr, None)
+            )
         if matched_attrs:
             return True, f"命中特征字段: {', '.join(matched_attrs)}"
         return False, "steal_all_images=false 且图片不含 emoji_id/emoji_package_id/key"
@@ -423,7 +542,7 @@ class PluginFacade:
                 )
                 usage_count = int(row.get("usage_count") or 0)
                 added_time = float(row.get("added_time") or time.time())
-                for _ in range(max(usage_count, 1)):
+                for _ in range(max(usage_count, 0)):
                     await self.storage.record_usage(
                         StickerUsageEvent(
                             asset_id=asset.asset_id,

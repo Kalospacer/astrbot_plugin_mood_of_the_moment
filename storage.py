@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import shutil
 import sqlite3
@@ -104,7 +105,7 @@ class StickerStorage:
                 conn.commit()
 
     def _build_asset_id(self, group_name: str) -> str:
-        return f"{group_name}-{int(time.time() * 1000)}"
+        return f"{group_name}-{int(time.time() * 1000)}-{os.urandom(4).hex()}"
 
     def _labels_to_json(self, labels: tuple[str, ...]) -> str:
         return json.dumps([label for label in labels if label], ensure_ascii=False)
@@ -492,13 +493,15 @@ class StickerStorage:
         source: str = "",
     ) -> bool:
         try:
-            normalized_storage_key = str(Path(file_path))
-            if Path(file_path).is_absolute():
-                normalized_storage_key = str(
-                    Path(file_path)
-                    .resolve()
-                    .relative_to(self.paths.stickers_dir.resolve())
-                ).replace("\\", "/")
+            candidate_path = Path(file_path)
+            stickers_root = self.paths.stickers_dir.resolve()
+            if candidate_path.is_absolute():
+                resolved_path = candidate_path.resolve()
+            else:
+                resolved_path = (stickers_root / candidate_path).resolve()
+            normalized_storage_key = str(
+                resolved_path.relative_to(stickers_root)
+            ).replace("\\", "/")
             group_name = tags[0] if tags else DEFAULT_CATEGORY
             with self._connect() as conn:
                 conn.execute(

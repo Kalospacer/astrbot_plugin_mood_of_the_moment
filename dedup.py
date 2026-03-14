@@ -58,6 +58,8 @@ class DHashDedupService:
             return ""
 
     def hamming_distance(self, left: str, right: str) -> int:
+        if not left or not right:
+            return 64
         max_len = max(len(left), len(right))
         left_bits = bin(int(left, 16))[2:].zfill(max_len * 4)
         right_bits = bin(int(right, 16))[2:].zfill(max_len * 4)

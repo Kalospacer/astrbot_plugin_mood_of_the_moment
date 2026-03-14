@@ -6,8 +6,6 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-
 from .constants import DEFAULT_CATEGORY
 
 
@@ -42,10 +40,11 @@ def resolve_user_path(raw_path: str) -> Path:
 
 
 def get_allowed_image_roots(
+    data_dir: Path,
     extra_roots: Iterable[Path] | None = None,
 ) -> tuple[Path, ...]:
     roots = {
-        Path(get_astrbot_data_path()).resolve(),
+        data_dir.resolve(),
         Path.cwd().resolve(),
     }
     if extra_roots:
