@@ -26,6 +26,3 @@ cleanup_count: 5
 enable_auto_cleanup: true
 min_stickers_to_keep: 0
 steal_all_images: false
-legacy_data_dirs: []
-legacy_plugin_dirs:
-  - "C:/astrbot/astrbot_plugin_angel_smile"

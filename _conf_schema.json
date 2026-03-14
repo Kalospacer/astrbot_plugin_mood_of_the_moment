@@ -50,20 +50,8 @@
   },
   "steal_all_images": {
     "description": "偷取所有图片",
-    "hint": "开启后，所有图片都会进入自动偷图审查；关闭时仅自动偷取 NapCat 原始 image 段中带有 emoji_id、emoji_package_id 或 key 标记的图片。",
+    "hint": "开启后，所有图片都会进入自动偷图审查；关闭时仅自动偷取QQ官方表情包。",
     "type": "bool",
     "default": false
-  },
-  "legacy_data_dirs": {
-    "description": "旧数据目录列表",
-    "hint": "第一阶段兼容旧插件资产时可填写额外旧数据目录。",
-    "type": "list",
-    "default": []
-  },
-  "legacy_plugin_dirs": {
-    "description": "旧插件目录列表",
-    "hint": "用于迁移旧插件自带 default 或本地素材目录。",
-    "type": "list",
-    "default": ["C:/astrbot/astrbot_plugin_angel_smile"]
   }
 }

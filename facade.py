@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from astrbot.api import logger
 
@@ -56,7 +52,6 @@ class PluginFacade:
         self.storage.initialize()
         self.dedup.initialize()
         self._import_default_catalog()
-        self._import_legacy_assets_if_needed()
 
     async def shutdown(self) -> None:
         self.storage.close()
@@ -230,84 +225,3 @@ class PluginFacade:
             except Exception as exc:
                 logger.warning(f"此刻的心情: 读取默认分类描述失败: {exc}")
 
-    def _import_legacy_assets_if_needed(self) -> None:
-        if self.storage.count_assets() > 0:
-            return
-        imported = 0
-        legacy_plugin_dirs = self.plugin_config.get("legacy_plugin_dirs") or []
-        if isinstance(legacy_plugin_dirs, str):
-            legacy_plugin_dirs = [legacy_plugin_dirs]
-        for raw_dir in legacy_plugin_dirs:
-            legacy_dir = Path(str(raw_dir)).expanduser().resolve()
-            default_json = legacy_dir / "default" / "memes_data.json"
-            if default_json.exists():
-                try:
-                    raw_data = json.loads(default_json.read_text(encoding="utf-8"))
-                    if isinstance(raw_data, dict):
-                        for category, description in raw_data.items():
-                            normalized = normalize_category_name(category)
-                            self.storage.upsert_group(StickerGroup(name=normalized, description=str(description or "").strip()))
-                except Exception as exc:
-                    logger.warning(f"此刻的心情: 读取旧分类描述失败: {exc}")
-            memes_dir = legacy_dir / "default" / "memes"
-            if not memes_dir.exists():
-                continue
-            for file_path in memes_dir.rglob("*"):
-                if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
-                    continue
-                try:
-                    category_name = file_path.relative_to(memes_dir).parts[0]
-                except Exception:
-                    category_name = DEFAULT_CATEGORY
-                normalized = normalize_category_name(category_name)
-                duplicate = self.dedup.find_similar_duplicate(file_path)
-                if duplicate is not None:
-                    continue
-                storage_key, original_name = self.storage.import_file(file_path, normalized)
-                asset = self.storage.add_asset(
-                    StickerAssetDraft(
-                        group_name=normalized,
-                        storage_key=storage_key,
-                        original_name=original_name,
-                        mime_hint=file_path.suffix.lower(),
-                        description=self.storage.get_catalog_description(normalized) or "",
-                        source="legacy_default_import",
-                        labels=(normalize_tag_display_name(category_name),),
-                    )
-                )
-                self.dedup.register_file(self.storage.resolve_path(asset.storage_key), asset)
-                imported += 1
-        legacy_data_dirs = self.plugin_config.get("legacy_data_dirs") or []
-        if isinstance(legacy_data_dirs, str):
-            legacy_data_dirs = [legacy_data_dirs]
-        for raw_dir in legacy_data_dirs:
-            candidate = Path(str(raw_dir)).expanduser().resolve()
-            if not candidate.exists() or not candidate.is_dir():
-                continue
-            for file_path in candidate.rglob("*"):
-                if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
-                    continue
-                try:
-                    category_name = file_path.parent.name or DEFAULT_CATEGORY
-                except Exception:
-                    category_name = DEFAULT_CATEGORY
-                normalized = normalize_category_name(category_name)
-                duplicate = self.dedup.find_similar_duplicate(file_path)
-                if duplicate is not None:
-                    continue
-                storage_key, original_name = self.storage.import_file(file_path, normalized)
-                asset = self.storage.add_asset(
-                    StickerAssetDraft(
-                        group_name=normalized,
-                        storage_key=storage_key,
-                        original_name=original_name,
-                        mime_hint=file_path.suffix.lower(),
-                        description=self.storage.get_catalog_description(normalized) or "",
-                        source="legacy_dir_import",
-                        labels=(normalize_tag_display_name(category_name),),
-                    )
-                )
-                self.dedup.register_file(self.storage.resolve_path(asset.storage_key), asset)
-                imported += 1
-        if imported:
-            logger.info(f"此刻的心情: 已导入旧资产 {imported} 个")
