@@ -77,12 +77,24 @@ class MoodOfTheMomentPlugin(Star):
         message_chain = getattr(event.message_obj, "message", None)
         if not message_chain:
             return
+        raw_image_payloads = self.facade.extract_image_segment_payloads(
+            getattr(event.message_obj, "raw_message", None)
+        )
+        raw_image_index = 0
         scheduled = False
         for item in message_chain:
             if not isinstance(item, Image):
                 continue
-            should_collect, reason = self.facade.explain_auto_collect_item(item)
-            image_url = item.url or item.path
+            raw_image_data = (
+                raw_image_payloads[raw_image_index]
+                if raw_image_index < len(raw_image_payloads)
+                else None
+            )
+            raw_image_index += 1
+            should_collect, reason = self.facade.explain_auto_collect_item(
+                item, raw_image_data=raw_image_data
+            )
+            image_url = self.facade.get_image_source(item, raw_image_data)
             logger.info(
                 f"{PLUGIN_NAME}: 收到图片消息 unified_msg_origin={event.unified_msg_origin} "
                 f"group_id={self.facade._mask_identifier(str(event.get_group_id()))} "

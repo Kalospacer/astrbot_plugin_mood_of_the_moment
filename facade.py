@@ -116,6 +116,37 @@ class PluginFacade:
         path = Path(image_source)
         return f"local:{path.name or '[unknown]'}"
 
+    @staticmethod
+    def extract_image_segment_payloads(raw_message) -> list[dict]:
+        segments = getattr(raw_message, "message", None)
+        if segments is None and isinstance(raw_message, dict):
+            segments = raw_message.get("message")
+        if not isinstance(segments, list):
+            return []
+        payloads: list[dict] = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            if segment.get("type") != "image":
+                continue
+            data = segment.get("data")
+            if isinstance(data, dict):
+                payloads.append(data)
+        return payloads
+
+    @staticmethod
+    def get_image_source(item, raw_image_data: dict | None = None) -> str:
+        if raw_image_data:
+            for key in ("url", "path", "file"):
+                value = str(raw_image_data.get(key) or "").strip()
+                if value:
+                    return value
+        for key in ("url", "path", "file"):
+            value = str(getattr(item, key, "") or "").strip()
+            if value:
+                return value
+        return ""
+
     async def _validate_image_file(self, image_path: Path) -> bool:
         return await asyncio.to_thread(self._validate_image_file_sync, image_path)
 
@@ -351,16 +382,26 @@ class PluginFacade:
             ok=True, message=f"已删除图片资产: {asset.asset_id}", asset=asset
         )
 
-    def explain_auto_collect_item(self, item) -> tuple[bool, str]:
+    def explain_auto_collect_item(
+        self, item, raw_image_data: dict | None = None
+    ) -> tuple[bool, str]:
         if not self.plugin_config.get("enable_auto_steal", True):
             return False, "enable_auto_steal=false"
         if self.plugin_config.get("steal_all_images", False):
             return True, "steal_all_images=true"
-        matched_attrs = [
-            attr
-            for attr in ("emoji_id", "emoji_package_id", "key")
-            if getattr(item, attr, None)
-        ]
+        matched_attrs: list[str] = []
+        if raw_image_data:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if raw_image_data.get(attr)
+            )
+        if not matched_attrs:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if getattr(item, attr, None)
+            )
         if matched_attrs:
             return True, f"命中特征字段: {', '.join(matched_attrs)}"
         return False, "steal_all_images=false 且图片不含 emoji_id/emoji_package_id/key"
