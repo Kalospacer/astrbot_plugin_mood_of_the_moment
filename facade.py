@@ -47,7 +47,11 @@ class PluginFacade:
             ),
         )
         self.allowed_image_roots = get_allowed_image_roots(
-            extra_roots=(self.paths.plugin_dir, self.paths.data_dir)
+            extra_roots=(
+                self.paths.plugin_dir,
+                self.paths.data_dir,
+                self.downloader.temp_dir,
+            )
         )
         self.inflight_sources: set[str] = set()
         self._cleanup_last_run = 0.0
@@ -92,6 +96,8 @@ class PluginFacade:
         group_name: str,
         description: str = "",
         preferred_name: str | None = None,
+        labels: tuple[str, ...] | None = None,
+        source: str = "manual",
     ) -> IngestResult:
         resolved = resolve_user_path(source_path)
         if not resolved.exists() or not resolved.is_file():
@@ -117,6 +123,11 @@ class PluginFacade:
         await self.storage.upsert_group(
             StickerGroup(name=normalized_group, description=(description or "").strip())
         )
+        normalized_labels = tuple(
+            normalize_tag_display_name(label)
+            for label in (labels or (group_name,))
+            if normalize_tag_display_name(label)
+        ) or (normalize_tag_display_name(group_name),)
         asset = await self.storage.add_asset(
             StickerAssetDraft(
                 group_name=normalized_group,
@@ -124,8 +135,8 @@ class PluginFacade:
                 original_name=original_name,
                 mime_hint=resolved.suffix.lower(),
                 description=(description or "").strip(),
-                source="manual",
-                labels=(normalize_tag_display_name(group_name),),
+                source=source,
+                labels=normalized_labels,
             )
         )
         await self.dedup.register_file(
@@ -143,17 +154,20 @@ class PluginFacade:
         description: str = "",
         preferred_name: str | None = None,
         source: str = "remote",
+        labels: tuple[str, ...] | None = None,
     ) -> IngestResult:
         temp_file = await self.downloader.download(image_url)
         if temp_file is None:
             return IngestResult(ok=False, message="下载图片失败")
         try:
             result = await self.ingest_local_file(
-                str(temp_file), group_name, description, preferred_name
+                str(temp_file),
+                group_name,
+                description,
+                preferred_name,
+                labels=labels,
+                source=source,
             )
-            if result.ok and result.asset is not None and source != "manual":
-                await self.storage.update_asset_source(result.asset.asset_id, source)
-                result.asset.source = source
             return result
         finally:
             self.downloader.cleanup(temp_file)
@@ -220,6 +234,7 @@ class PluginFacade:
                 group_name=normalized_group,
                 description=str(review_result.get("reason") or "").strip(),
                 source=f"auto_steal_group:{source_group}_user:{source_user}",
+                labels=tuple(tags) if tags else None,
             )
             logger.info(
                 f"此刻的心情: 自动采集保存完成 ok={result.ok} "
@@ -423,7 +438,7 @@ class PluginFacade:
                 )
                 usage_count = int(row.get("usage_count") or 0)
                 added_time = float(row.get("added_time") or time.time())
-                for _ in range(max(usage_count, 1)):
+                for _ in range(max(usage_count, 0)):
                     await self.storage.record_usage(
                         StickerUsageEvent(
                             asset_id=asset.asset_id,

@@ -12,13 +12,17 @@ from .constants import SUPPORTED_IMAGE_SUFFIXES
 
 
 class RemoteImageDownloader:
+    @property
+    def temp_dir(self) -> Path:
+        return Path(tempfile.gettempdir()) / "mood_of_the_moment"
+
     async def download(self, image_url: str) -> Path | None:
         try:
             parsed_url = urlparse(image_url)
             file_suffix = Path(parsed_url.path).suffix.lower()
             if file_suffix not in SUPPORTED_IMAGE_SUFFIXES:
                 file_suffix = ".jpg"
-            temp_dir = Path(tempfile.gettempdir()) / "mood_of_the_moment"
+            temp_dir = self.temp_dir
             temp_dir.mkdir(parents=True, exist_ok=True)
             temp_file = temp_dir / f"download_{os.urandom(8).hex()}{file_suffix}"
             timeout = aiohttp.ClientTimeout(total=30)
