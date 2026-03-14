@@ -85,8 +85,10 @@ class MoodOfTheMomentPlugin(Star):
             image_url = item.url or item.path
             logger.info(
                 f"{PLUGIN_NAME}: 收到图片消息 unified_msg_origin={event.unified_msg_origin} "
-                f"group_id={event.get_group_id()} sender_id={event.get_sender_id()} "
-                f"image_url={image_url or ''} decision={should_collect} reason={reason}"
+                f"group_id={self.facade._mask_identifier(str(event.get_group_id()))} "
+                f"sender_id={self.facade._mask_identifier(str(event.get_sender_id()))} "
+                f"image_url={self.facade.summarize_image_source(image_url or '')} "
+                f"decision={should_collect} reason={reason}"
             )
             if not should_collect:
                 continue
@@ -101,7 +103,10 @@ class MoodOfTheMomentPlugin(Star):
                 )
             )
             self._track_task(task)
-            logger.info(f"{PLUGIN_NAME}: 已创建自动采集任务 image_url={image_url}")
+            logger.info(
+                f"{PLUGIN_NAME}: 已创建自动采集任务 "
+                f"image_url={self.facade.summarize_image_source(image_url)}"
+            )
             scheduled = True
         if scheduled:
             cleanup_task = asyncio.create_task(self.facade.maybe_run_cleanup())
@@ -143,9 +148,7 @@ class MoodOfTheMomentPlugin(Star):
         )
         if not items:
             await event.send(
-                MessageChain().message(
-                    "当前会话里还没有 cleanroom foundation 发出的图片记录。"
-                )
+                MessageChain().message("当前会话里还没有此刻的心情插件发出的图片记录。")
             )
             return
         lines = [f"当前会话最近 {len(items)} 条图片资产记录："]

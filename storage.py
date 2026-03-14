@@ -492,13 +492,15 @@ class StickerStorage:
         source: str = "",
     ) -> bool:
         try:
-            normalized_storage_key = str(Path(file_path))
-            if Path(file_path).is_absolute():
-                normalized_storage_key = str(
-                    Path(file_path)
-                    .resolve()
-                    .relative_to(self.paths.stickers_dir.resolve())
-                ).replace("\\", "/")
+            candidate_path = Path(file_path)
+            stickers_root = self.paths.stickers_dir.resolve()
+            if candidate_path.is_absolute():
+                resolved_path = candidate_path.resolve()
+            else:
+                resolved_path = (stickers_root / candidate_path).resolve()
+            normalized_storage_key = str(
+                resolved_path.relative_to(stickers_root)
+            ).replace("\\", "/")
             group_name = tags[0] if tags else DEFAULT_CATEGORY
             with self._connect() as conn:
                 conn.execute(

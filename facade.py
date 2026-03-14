@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from astrbot.api import logger
+from PIL import Image, UnidentifiedImageError
 
 from .constants import DEFAULT_CATEGORY, SUPPORTED_IMAGE_SUFFIXES
 from .dedup import DHashDedupService
@@ -54,6 +57,8 @@ class PluginFacade:
             )
         )
         self.inflight_sources: set[str] = set()
+        self._inflight_lock = asyncio.Lock()
+        self._ingest_lock = asyncio.Lock()
         self._cleanup_last_run = 0.0
 
     def set_context(self, context) -> None:
@@ -90,6 +95,38 @@ class PluginFacade:
     async def decorate_text(self, text: str, scope_key: str) -> DecoratedContent:
         return await self.renderer.decorate_text(text=text, scope_key=scope_key)
 
+    @staticmethod
+    def _is_remote_image_source(image_source: str) -> bool:
+        parsed = urlparse(image_source)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _mask_identifier(value: str) -> str:
+        text = value.strip()
+        if len(text) <= 4:
+            return text or "-"
+        return f"{text[:2]}***{text[-2:]}"
+
+    def summarize_image_source(self, image_source: str) -> str:
+        if self._is_remote_image_source(image_source):
+            parsed = urlparse(image_source)
+            path = parsed.path or "/"
+            return f"{parsed.scheme}://{parsed.netloc}{path}"
+        path = Path(image_source)
+        return f"local:{path.name or '[unknown]'}"
+
+    async def _validate_image_file(self, image_path: Path) -> bool:
+        return await asyncio.to_thread(self._validate_image_file_sync, image_path)
+
+    @staticmethod
+    def _validate_image_file_sync(image_path: Path) -> bool:
+        try:
+            with Image.open(image_path) as image:
+                image.verify()
+            return True
+        except (OSError, UnidentifiedImageError):
+            return False
+
     async def ingest_local_file(
         self,
         source_path: str,
@@ -109,40 +146,45 @@ class PluginFacade:
             )
         if not is_path_within_roots(resolved, self.allowed_image_roots):
             return IngestResult(ok=False, message=f"图片路径超出允许范围: {resolved}")
+        if not await self._validate_image_file(resolved):
+            return IngestResult(ok=False, message=f"图片内容无效或已损坏: {resolved}")
         normalized_group = normalize_category_name(group_name)
-        duplicate = await self.dedup.find_similar_duplicate(resolved)
-        if duplicate is not None:
-            return IngestResult(
-                ok=False,
-                message=f"检测到重复资产: {duplicate.asset_id}",
-                duplicate_of=duplicate.asset_id,
+        async with self._ingest_lock:
+            duplicate = await self.dedup.find_similar_duplicate(resolved)
+            if duplicate is not None:
+                return IngestResult(
+                    ok=False,
+                    message=f"检测到重复资产: {duplicate.asset_id}",
+                    duplicate_of=duplicate.asset_id,
+                )
+            storage_key, original_name = await self.storage.import_file(
+                resolved, normalized_group, preferred_name
             )
-        storage_key, original_name = await self.storage.import_file(
-            resolved, normalized_group, preferred_name
-        )
-        await self.storage.upsert_group(
-            StickerGroup(name=normalized_group, description=(description or "").strip())
-        )
-        normalized_labels = tuple(
-            normalize_tag_display_name(label)
-            for label in (labels or (group_name,))
-            if normalize_tag_display_name(label)
-        ) or (normalize_tag_display_name(group_name),)
-        asset = await self.storage.add_asset(
-            StickerAssetDraft(
-                group_name=normalized_group,
-                storage_key=storage_key,
-                original_name=original_name,
-                mime_hint=resolved.suffix.lower(),
-                description=(description or "").strip(),
-                source=source,
-                labels=normalized_labels,
+            await self.storage.upsert_group(
+                StickerGroup(
+                    name=normalized_group, description=(description or "").strip()
+                )
             )
-        )
-        await self.dedup.register_file(
-            await self.storage.resolve_path(asset.storage_key), asset
-        )
-        return IngestResult(ok=True, message="导入成功", asset=asset)
+            normalized_labels = tuple(
+                normalize_tag_display_name(label)
+                for label in (labels or (group_name,))
+                if normalize_tag_display_name(label)
+            ) or (normalize_tag_display_name(group_name),)
+            asset = await self.storage.add_asset(
+                StickerAssetDraft(
+                    group_name=normalized_group,
+                    storage_key=storage_key,
+                    original_name=original_name,
+                    mime_hint=resolved.suffix.lower(),
+                    description=(description or "").strip(),
+                    source=source,
+                    labels=normalized_labels,
+                )
+            )
+            await self.dedup.register_file(
+                await self.storage.resolve_path(asset.storage_key), asset
+            )
+            return IngestResult(ok=True, message="导入成功", asset=asset)
 
     async def review_remote_image(self, image_url: str) -> dict:
         return await self.review.review_image(image_url)
@@ -194,19 +236,32 @@ class PluginFacade:
         source_group: str,
         source_user: str,
     ) -> dict:
+        sanitized_source = self.summarize_image_source(image_url)
         logger.info(
             f"此刻的心情: 开始处理自动采集 source_group={source_group} "
-            f"source_user={source_user} image_url={image_url}"
+            f"source_user={self._mask_identifier(source_user)} image_url={sanitized_source}"
         )
-        if image_url in self.inflight_sources:
-            logger.info(f"此刻的心情: 跳过重复自动采集任务 image_url={image_url}")
-            return {"success": False, "message": "图片正在处理，已跳过重复任务"}
+        async with self._inflight_lock:
+            if image_url in self.inflight_sources:
+                logger.info(
+                    f"此刻的心情: 跳过重复自动采集任务 image_url={sanitized_source}"
+                )
+                return {"success": False, "message": "图片正在处理，已跳过重复任务"}
+            self.inflight_sources.add(image_url)
+        if not self._is_remote_image_source(image_url):
+            logger.warning(
+                f"此刻的心情: 自动采集仅支持远程图片源，已跳过 image_url={sanitized_source}"
+            )
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
+            return {"success": False, "message": "自动采集仅支持远程图片 URL"}
         if not await self.can_accept_more_assets(
             self.plugin_config.get("max_stickers")
         ):
             logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "当前图片资产数量已达到上限"}
-        self.inflight_sources.add(image_url)
         try:
             review_result = await self.review_remote_image(image_url)
             logger.info(
@@ -250,7 +305,8 @@ class PluginFacade:
             logger.error(f"此刻的心情: 自动采集失败: {exc}", exc_info=True)
             return {"success": False, "message": f"自动采集失败: {exc}"}
         finally:
-            self.inflight_sources.discard(image_url)
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
 
     async def inspect_recent(self, scope_key: str, limit: int = 5):
         usage_events = await self.storage.list_recent_usage(scope_key, limit)
