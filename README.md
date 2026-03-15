@@ -59,4 +59,5 @@ enable_auto_steal: true        # 是否启用自动偷取表情包功能
 steal_all_images: false        # 若设为 true，则不再只处理QQ官方表情包，而是审查所有图片
 enable_auto_cleanup: true      # 开启表情包的自动清理机制，删除x条使用次数最少的表情包
 max_stickers_per_message: 1    # 控制每条消息最多被替换出几张表情包（避免模型抽风全是图）
+max_prompt_tags: 30            # 每次注入给 LLM 的高频标签上限，避免提示词过长
 ```

@@ -15,7 +15,6 @@ from astrbot.api import logger
 from .constants import (
     DEFAULT_CATEGORY,
     DEFAULT_CATEGORY_DESCRIPTION,
-    SUPPORTED_IMAGE_SUFFIXES,
 )
 from .models import (
     PluginPaths,
@@ -216,7 +215,7 @@ class StickerStorage:
         group_name: str | None = None,
         labels: tuple[str, ...] = (),
         limit: int | None = None,
-        match_all: bool = False,
+        match_all: bool = True,
     ) -> list[StickerAsset]:
         return await asyncio.to_thread(
             self._query_assets_sync, group_name, labels, limit, match_all
@@ -227,7 +226,7 @@ class StickerStorage:
         group_name: str | None = None,
         labels: tuple[str, ...] = (),
         limit: int | None = None,
-        match_all: bool = False,  # match_all=True表示AND逻辑，False表示OR逻辑
+        match_all: bool = True,  # match_all=True表示AND逻辑，False表示OR逻辑
     ) -> list[StickerAsset]:
         sql = "SELECT asset_id, group_name, storage_key, original_name, mime_hint, description, source, created_at, usage_count, last_used_at, labels_json FROM sticker_assets"
         params: list[object] = []
@@ -243,7 +242,7 @@ class StickerStorage:
         assets = [self._row_to_asset(row) for row in rows]
         if not labels:
             return assets
-        
+
         expected = set(labels)
         if match_all:
             # AND逻辑：资源必须包含所有查询的标签
@@ -438,7 +437,9 @@ class StickerStorage:
                 index.setdefault(tag, []).append(asset.asset_id)
         return index
 
-    async def get_memes_by_tags(self, tags: list[str], match_all: bool = False) -> list[dict[str, Any]]:
+    async def get_memes_by_tags(
+        self, tags: list[str], match_all: bool = True
+    ) -> list[dict[str, Any]]:
         normalized = tuple(tag for tag in tags if tag)
         assets = await self.query_assets(labels=normalized, match_all=match_all)
         result = []
