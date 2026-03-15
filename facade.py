@@ -48,6 +48,7 @@ class PluginFacade:
             max_stickers_per_message=int(
                 self.plugin_config.get("max_stickers_per_message", 1) or 1
             ),
+            max_prompt_tags=int(self.plugin_config.get("max_prompt_tags", 30) or 30),
         )
         self.allowed_image_roots = get_allowed_image_roots(
             data_dir=self.paths.data_dir,
@@ -71,6 +72,9 @@ class PluginFacade:
         self.review.set_plugin_config(self.plugin_config)
         self.renderer.max_stickers_per_message = max(
             0, int(self.plugin_config.get("max_stickers_per_message", 1) or 1)
+        )
+        self.renderer.max_prompt_tags = max(
+            0, int(self.plugin_config.get("max_prompt_tags", 30) or 30)
         )
 
     async def startup(self) -> None:

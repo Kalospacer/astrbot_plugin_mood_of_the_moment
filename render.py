@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import re
+from difflib import SequenceMatcher
 from itertools import combinations
 
 from astrbot.api import logger
@@ -11,9 +12,15 @@ from .models import DecoratedContent, DecoratedSegment, ParsedMarker
 
 
 class StickerRenderer:
-    def __init__(self, storage, max_stickers_per_message: int = 1):
+    def __init__(
+        self,
+        storage,
+        max_stickers_per_message: int = 1,
+        max_prompt_tags: int = 30,
+    ):
         self.storage = storage
         self.max_stickers_per_message = max(0, int(max_stickers_per_message))
+        self.max_prompt_tags = max(0, int(max_prompt_tags))
 
     async def build_sticker_list(self) -> str:
         all_tags = await self.storage.get_all_tags()
@@ -22,27 +29,26 @@ class StickerRenderer:
         return "\n".join(f"- :{tag}:" for tag in all_tags[:20])
 
     async def build_prompt_catalog(self) -> str:
-        all_tags = await self.storage.get_all_tags()
+        all_tags = await self.storage.get_tag_index()
         if not all_tags:
             return ""
-        tag_index = await self.storage.get_tag_index()
         tag_counts = []
-        for tag in all_tags:
-            meme_ids = tag_index.get(tag, [])
+        for tag, meme_ids in all_tags.items():
             tag_counts.append((tag, len(meme_ids)))
         tag_counts.sort(key=lambda item: item[1], reverse=True)
-        top_tags = [tag for tag, _ in tag_counts[:30]]
+        top_tags = [tag for tag, _ in tag_counts[: self.max_prompt_tags]]
         tag_list = ", ".join(f":{tag}:" for tag in top_tags)
         return (
             "<表情包标签库>\n"
             f"可用标签：{tag_list}\n"
             "使用方式：组合多个标签，如 :amused:cat: 表示又开心又是猫的表情\n"
-            "提示：标签越多，匹配越精准；没有匹配则不发送表情包\n"
+            "提示：标签越多，匹配越精准；没有匹配则静默删除标签不发送表情包\n"
             "</表情包标签库>"
         )
 
     def parse_markers(self, text: str) -> list[ParsedMarker]:
         markers: list[ParsedMarker] = []
+        # 支持中英文冒号，标签可包含字母、数字、下划线、连字符、中文字符
         pattern = re.compile(r"(?:(?::|：)[a-zA-Z0-9_\-\u4e00-\u9fff]+)+(?:[:：])")
         for match in pattern.finditer(text):
             raw_text = match.group(0)
@@ -63,9 +69,27 @@ class StickerRenderer:
             )
         return markers
 
+    def _calculate_similarity(self, s1: str, s2: str) -> float:
+        """计算两个字符串的相似度 (0.0 - 1.0)"""
+        if s1 == s2:
+            return 1.0
+        if not s1 or not s2:
+            return 0.0
+        return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+
     def _score_asset_match(
         self, requested_tags: tuple[str, ...], candidate_tags: list[str]
     ) -> float:
+        """
+        评分体系（优化版）：
+        - 精确匹配标签：+10分/个
+        - 匹配比例加成：+(匹配数/请求数)×5
+        - 首标签匹配：+8分
+        - 高相似度匹配(>=0.8)：+5分
+        - 中等相似度匹配(>=0.6)：+2分
+        - 子串匹配：+2.5分
+        - 前缀匹配(前2字符)：+1分
+        """
         if not requested_tags:
             return 0.0
         normalized_requested = [tag.strip() for tag in requested_tags if tag.strip()]
@@ -77,37 +101,66 @@ class StickerRenderer:
 
         candidate_set = set(normalized_candidate)
         score = 0.0
-        exact_hits = [tag for tag in normalized_requested if tag in candidate_set]
-        score += len(exact_hits) * 10.0
-        score += (len(exact_hits) / len(normalized_requested)) * 5.0
+        exact_matches = 0
 
+        # 精确匹配得分（最高优先级）
+        for tag in normalized_requested:
+            if tag in candidate_set:
+                score += 10.0
+                exact_matches += 1
+
+        if exact_matches > 0:
+            score += (exact_matches / len(normalized_requested)) * 5.0
+
+        # 首标签匹配额外加分
         first_tag = normalized_requested[0]
         if first_tag in candidate_set:
             score += 8.0
 
+        # 模糊匹配：相似度、子串匹配和前缀匹配
         for requested in normalized_requested:
             for candidate in normalized_candidate:
                 if requested == candidate:
-                    continue
+                    continue  # 精确匹配已计分
+
+                # 计算相似度
+                similarity = self._calculate_similarity(requested, candidate)
+                if similarity >= 0.8:
+                    score += 5.0 * similarity  # 高相似度
+                elif similarity >= 0.6:
+                    score += 2.0 * similarity  # 中等相似度
+
+                # 子串匹配
                 if requested in candidate or candidate in requested:
                     score += 2.5
-                elif requested[:2] and candidate[:2] and requested[:2] == candidate[:2]:
-                    score += 1.0
+                # 前缀匹配（前2字符）
+                elif len(requested) >= 2 and len(candidate) >= 2:
+                    if requested[:2].lower() == candidate[:2].lower():
+                        score += 1.0
 
-        if not exact_hits and first_tag not in candidate_set:
-            score -= 0.5
+        # 完全没有任何匹配时返回0分（表示不相关）
+        if score == 0.0:
+            return 0.0
         return score
 
-    def _iter_tag_subsets(
+    def _iter_tag_subsets_by_level(
         self, requested_tags: tuple[str, ...]
-    ) -> list[tuple[str, ...]]:
+    ) -> list[tuple[int, list[tuple[str, ...]]]]:
+        """
+        按匹配数层级生成所有子集组合
+        返回：[(匹配数, [子集1, 子集2, ...]), ...]
+        例如3个标签abc → [(3, [(a,b,c)]), (2, [(a,b), (a,c), (b,c)]), (1, [(a,), (b,), (c,)])]
+        """
         normalized = tuple(tag for tag in requested_tags if tag)
-        subsets: list[tuple[str, ...]] = []
+        if not normalized:
+            return []
+
+        result: list[tuple[int, list[tuple[str, ...]]]] = []
         for size in range(len(normalized), 0, -1):
-            level = list(combinations(normalized, size))
-            level.sort(key=lambda subset: (subset[0] != normalized[0], subset))
-            subsets.extend(level)
-        return subsets
+            level_subsets = list(combinations(normalized, size))
+            if level_subsets:
+                result.append((size, level_subsets))
+        return result
 
     def _pick_top_scored_asset(
         self, scored_assets: list[tuple[float, dict]]
@@ -129,35 +182,59 @@ class StickerRenderer:
         return random.choice(top_assets) if top_assets else None
 
     async def _select_best_asset(self, requested_tags: tuple[str, ...]) -> dict | None:
-        for subset in self._iter_tag_subsets(requested_tags):
-            exact_assets = await self.storage.get_memes_by_tags(list(subset))
-            if exact_assets:
-                if len(subset) == len(requested_tags):
-                    return random.choice(exact_assets)
-                return self._pick_top_scored_asset(
-                    [
-                        (
-                            self._score_asset_match(
-                                requested_tags, list(asset.get("tags") or [])
-                            ),
-                            asset,
-                        )
-                        for asset in exact_assets
-                    ]
-                )
-
-        candidates = await self.storage.get_all_memes()
-        if not candidates:
+        """
+        逐级降级匹配算法（5→4→3→2→1→静默失败）：
+        1. 按匹配标签数从高到低遍历
+        2. 每级收集所有该匹配数的候选资源
+        3. 只要某一级有候选，立即在该级内评分选最优返回
+        4. 完全不匹配时返回 None（静默失败）
+        """
+        if not requested_tags:
             return None
 
-        scored_candidates: list[tuple[float, dict]] = []
-        for candidate in candidates:
-            candidate_tags = list(candidate.get("tags") or [])
-            score = self._score_asset_match(requested_tags, candidate_tags)
-            scored_candidates.append((score, candidate))
-        return self._pick_top_scored_asset(scored_candidates)
+        # 生成按匹配数分组的子集
+        subsets_by_level = self._iter_tag_subsets_by_level(requested_tags)
+
+        # 逐级查询（从高到低）
+        for _, subsets in subsets_by_level:
+            candidates = []
+            for subset in subsets:
+                # match_all=True: 资源必须包含子集中的所有标签
+                assets = await self.storage.get_memes_by_tags(
+                    list(subset), match_all=True
+                )
+                candidates.extend(assets)
+
+            if candidates:
+                # 去重（同一个资源可能被多个子集匹配到）
+                seen_ids = set()
+                unique_candidates = []
+                for asset in candidates:
+                    meme_id = asset.get("meme_id")
+                    if meme_id and meme_id not in seen_ids:
+                        seen_ids.add(meme_id)
+                        unique_candidates.append(asset)
+
+                # 在该匹配级别内评分选最优
+                scored = [
+                    (
+                        self._score_asset_match(
+                            requested_tags, list(asset.get("tags") or [])
+                        ),
+                        asset,
+                    )
+                    for asset in unique_candidates
+                ]
+                return self._pick_top_scored_asset(scored)
+
+        # 逐级降级完全无命中，返回 None（静默失败）
+        return None
 
     async def decorate_text(self, text: str, scope_key: str) -> DecoratedContent:
+        """
+        处理文本中的标签，替换为表情包图片
+        未匹配的标签会被静默删除（不显示给用户）
+        """
         markers = self.parse_markers(text)
         if not markers:
             return DecoratedContent(
@@ -167,6 +244,7 @@ class StickerRenderer:
         segments: list[DecoratedSegment] = []
         cursor = 0
         stickers_used = 0
+
         for marker in markers:
             if marker.start > cursor:
                 segments.append(
@@ -182,16 +260,33 @@ class StickerRenderer:
                     stickers_used += 1
                     if meme_id:
                         await self.storage.increment_usage_count(meme_id, scope_key)
-                else:
-                    segments.append(
-                        DecoratedSegment(kind="text", value=marker.raw_text)
-                    )
-            else:
-                segments.append(DecoratedSegment(kind="text", value=marker.raw_text))
+                # 表情包数据存在但文件路径无效时，静默删除该标签
+            # 未匹配到表情包或超过张数限制时，静默删除该标签
             cursor = marker.end
+
         if cursor < len(text):
             segments.append(DecoratedSegment(kind="text", value=text[cursor:]))
-        return DecoratedContent(segments=segments)
+
+        merged_segments: list[DecoratedSegment] = []
+        text_buffer: list[str] = []
+        for segment in segments:
+            if segment.kind == "text":
+                if segment.value:
+                    text_buffer.append(segment.value)
+                continue
+            if text_buffer:
+                merged_segments.append(
+                    DecoratedSegment(kind="text", value="".join(text_buffer))
+                )
+                text_buffer = []
+            merged_segments.append(segment)
+
+        if text_buffer:
+            merged_segments.append(
+                DecoratedSegment(kind="text", value="".join(text_buffer))
+            )
+
+        return DecoratedContent(segments=merged_segments)
 
     async def render_text(self, text: str) -> list:
         try:

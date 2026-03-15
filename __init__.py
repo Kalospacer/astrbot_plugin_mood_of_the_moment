@@ -1,1 +1,1 @@
-from .main import MoodOfTheMomentPlugin
+from .main import MoodOfTheMomentPlugin as MoodOfTheMomentPlugin
