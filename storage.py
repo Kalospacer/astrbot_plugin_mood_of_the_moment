@@ -216,9 +216,10 @@ class StickerStorage:
         group_name: str | None = None,
         labels: tuple[str, ...] = (),
         limit: int | None = None,
+        match_all: bool = False,
     ) -> list[StickerAsset]:
         return await asyncio.to_thread(
-            self._query_assets_sync, group_name, labels, limit
+            self._query_assets_sync, group_name, labels, limit, match_all
         )
 
     def _query_assets_sync(
@@ -226,6 +227,7 @@ class StickerStorage:
         group_name: str | None = None,
         labels: tuple[str, ...] = (),
         limit: int | None = None,
+        match_all: bool = False,  # match_all=True表示AND逻辑，False表示OR逻辑
     ) -> list[StickerAsset]:
         sql = "SELECT asset_id, group_name, storage_key, original_name, mime_hint, description, source, created_at, usage_count, last_used_at, labels_json FROM sticker_assets"
         params: list[object] = []
@@ -241,8 +243,14 @@ class StickerStorage:
         assets = [self._row_to_asset(row) for row in rows]
         if not labels:
             return assets
+        
         expected = set(labels)
-        return [asset for asset in assets if expected.issubset(set(asset.labels))]
+        if match_all:
+            # AND逻辑：资源必须包含所有查询的标签
+            return [asset for asset in assets if expected.issubset(set(asset.labels))]
+        else:
+            # OR逻辑：资源包含任意一个查询的标签即可（用于降级匹配）
+            return [asset for asset in assets if expected & set(asset.labels)]
 
     async def get_asset(self, asset_id: str) -> StickerAsset | None:
         return await asyncio.to_thread(self._get_asset_sync, asset_id)
@@ -430,9 +438,9 @@ class StickerStorage:
                 index.setdefault(tag, []).append(asset.asset_id)
         return index
 
-    async def get_memes_by_tags(self, tags: list[str]) -> list[dict[str, Any]]:
+    async def get_memes_by_tags(self, tags: list[str], match_all: bool = False) -> list[dict[str, Any]]:
         normalized = tuple(tag for tag in tags if tag)
-        assets = await self.query_assets(labels=normalized)
+        assets = await self.query_assets(labels=normalized, match_all=match_all)
         result = []
         for asset in assets:
             resolved_path = await self.resolve_path(asset.storage_key)
