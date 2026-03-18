@@ -19,7 +19,6 @@ from .models import (
     PluginPaths,
     StickerAssetDraft,
     StickerGroup,
-    StickerUsageEvent,
 )
 
 from .render import StickerRenderer
@@ -94,7 +93,6 @@ class PluginFacade:
             logger.info("此刻的心情: 启动时未发现失效资产")
         await self.dedup.initialize()
         await self._import_default_catalog()
-        await self._import_legacy_sqlite_if_present()
 
     async def shutdown(self) -> None:
         await self.storage.close()
@@ -570,111 +568,3 @@ class PluginFacade:
                         )
             except Exception as exc:
                 logger.warning(f"此刻的心情: 读取默认分类描述失败: {exc}")
-
-    async def _import_legacy_sqlite_if_present(self) -> None:
-        if await self.storage.count_assets() > 0:
-            return
-        legacy_root = self.paths.plugin_dir.parent / "astrbot_plugin_angel_smile"
-        candidate_dbs = [
-            legacy_root / "data" / "memes.db",
-            legacy_root / "data" / "cleanroom" / "assets.sqlite3",
-        ]
-        legacy_db = next((path for path in candidate_dbs if path.exists()), None)
-        if legacy_db is None:
-            return
-        rows: list[dict[str, object]] = []
-        try:
-            import sqlite3
-
-            conn = sqlite3.connect(str(legacy_db))
-            conn.row_factory = sqlite3.Row
-            table_names = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-            }
-            if "memes" in table_names:
-                rows = [
-                    dict(row)
-                    for row in conn.execute(
-                        "SELECT meme_id, file_path, tags, source, usage_count, added_time FROM memes"
-                    ).fetchall()
-                ]
-            elif "assets" in table_names:
-                rows = [
-                    {
-                        "meme_id": row["asset_id"],
-                        "file_path": row["storage_key"],
-                        "tags": row["labels_json"],
-                        "source": row["source"],
-                        "usage_count": row["usage_count"],
-                        "added_time": row["created_at"],
-                    }
-                    for row in conn.execute(
-                        "SELECT asset_id, storage_key, labels_json, source, usage_count, created_at FROM assets"
-                    ).fetchall()
-                ]
-            conn.close()
-        except Exception as exc:
-            logger.warning(f"此刻的心情: 读取旧 SQLite 数据失败: {exc}")
-            return
-        imported = 0
-        for row in rows:
-            try:
-                raw_file_path = Path(str(row.get("file_path") or ""))
-                if raw_file_path.is_absolute():
-                    file_path = raw_file_path.resolve()
-                else:
-                    file_path = (legacy_root / raw_file_path).resolve()
-                if not file_path.exists() or not file_path.is_file():
-                    continue
-                duplicate = await self.dedup.find_similar_duplicate(file_path)
-                if duplicate is not None:
-                    continue
-                try:
-                    raw_tags = json.loads(str(row.get("tags") or "[]"))
-                except Exception:
-                    raw_tags = []
-                tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
-                category = normalize_category_name(
-                    tags[0] if tags else file_path.parent.name
-                )
-                storage_key, original_name = await self.storage.import_file(
-                    file_path, category
-                )
-                await self.storage.upsert_group(
-                    StickerGroup(name=category, description="")
-                )
-                asset = await self.storage.add_asset(
-                    StickerAssetDraft(
-                        group_name=category,
-                        storage_key=storage_key,
-                        original_name=original_name,
-                        mime_hint=file_path.suffix.lower(),
-                        description=", ".join(tags),
-                        source=str(
-                            row.get("source") or f"legacy_sqlite:{legacy_db.name}"
-                        ),
-                        labels=tuple(tags) if tags else (category,),
-                    )
-                )
-                usage_count = int(row.get("usage_count") or 0)
-                added_time = float(row.get("added_time") or time.time())
-                for _ in range(max(usage_count, 0)):
-                    await self.storage.record_usage(
-                        StickerUsageEvent(
-                            asset_id=asset.asset_id,
-                            scope_key="legacy-import",
-                            created_at=added_time,
-                        )
-                    )
-                await self.dedup.register_file(
-                    await self.storage.resolve_path(asset.storage_key),
-                    asset,
-                )
-                imported += 1
-            except Exception as exc:
-                logger.warning(f"此刻的心情: 导入旧 SQLite 资产失败: {exc}")
-        if imported:
-            logger.info(f"此刻的心情: 已从旧 SQLite 导入资产 {imported} 个")
