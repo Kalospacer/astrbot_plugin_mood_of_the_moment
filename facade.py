@@ -78,6 +78,11 @@ class PluginFacade:
         )
 
     async def startup(self) -> None:
+        deleted_temp_files = await asyncio.to_thread(self.downloader.cleanup_temp_dir)
+        if deleted_temp_files:
+            logger.info(
+                f"此刻的心情: 启动时清理下载临时文件 {deleted_temp_files} 个"
+            )
         await self.storage.initialize()
         stale_asset_ids = await self.storage.prune_missing_assets()
         if stale_asset_ids:
@@ -119,6 +124,100 @@ class PluginFacade:
             return f"{parsed.scheme}://{parsed.netloc}{path}"
         path = Path(image_source)
         return f"local:{path.name or '[unknown]'}"
+
+    @staticmethod
+    def _normalize_text(value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @classmethod
+    def _has_store_emoji_markers(
+        cls, item, raw_image_data: dict | None = None
+    ) -> tuple[bool, list[str]]:
+        matched_attrs: list[str] = []
+        if raw_image_data:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if raw_image_data.get(attr)
+            )
+        if not matched_attrs:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if getattr(item, attr, None)
+            )
+        return bool(matched_attrs), matched_attrs
+
+    @classmethod
+    def _is_emoji_type_image(cls, item, raw_image_data: dict | None = None) -> bool:
+        def _is_emoji_summary(summary: object) -> bool:
+            text = cls._normalize_text(summary).lower()
+            return bool(text) and (
+                "表情" in text or "emoji" in text or "sticker" in text
+            )
+
+        def _is_sub_type_emoji(sub_type: object) -> bool:
+            if sub_type in (1, "1"):
+                return True
+            try:
+                return int(sub_type) == 1
+            except Exception:
+                return False
+
+        has_store_markers, _ = cls._has_store_emoji_markers(item, raw_image_data)
+        if has_store_markers:
+            return True
+
+        candidate_payloads: list[dict] = []
+        if isinstance(raw_image_data, dict):
+            candidate_payloads.append(raw_image_data)
+
+        item_dict = getattr(item, "__dict__", None)
+        if isinstance(item_dict, dict):
+            candidate_payloads.append(item_dict)
+
+        try:
+            raw_dict = item.toDict()
+            if isinstance(raw_dict, dict):
+                data = raw_dict.get("data")
+                if isinstance(data, dict):
+                    candidate_payloads.append(data)
+                else:
+                    candidate_payloads.append(raw_dict)
+        except Exception:
+            pass
+
+        for payload in candidate_payloads:
+            sub_type = payload.get("sub_type")
+            if _is_sub_type_emoji(sub_type):
+                return True
+            sub_type = payload.get("subType")
+            if _is_sub_type_emoji(sub_type):
+                return True
+
+            summary = payload.get("summary")
+            if _is_emoji_summary(summary):
+                return True
+
+            image_type = cls._normalize_text(
+                payload.get("type")
+                or payload.get("imageType")
+                or payload.get("image_type")
+            ).lower()
+            if image_type in {"emoji", "sticker", "face", "meme"}:
+                return True
+
+            url = cls._normalize_text(payload.get("url"))
+            if "vip.qq.com/club/item/parcel" in url or "gxh.vip.qq.com" in url:
+                return True
+
+        sub_type = getattr(item, "subType", None)
+        if _is_sub_type_emoji(sub_type):
+            return True
+
+        return False
 
     @staticmethod
     def extract_image_segment_payloads(raw_message) -> list[dict]:
@@ -304,7 +403,24 @@ class PluginFacade:
             async with self._inflight_lock:
                 self.inflight_sources.discard(image_url)
             return {"success": False, "message": "当前图片资产数量已达到上限"}
+        temp_file: Path | None = None
         try:
+            temp_file = await self.downloader.download(image_url)
+            if temp_file is None:
+                return {"success": False, "message": "下载图片失败"}
+            if not await self._validate_image_file(temp_file):
+                return {"success": False, "message": "图片内容无效或已损坏"}
+            duplicate = await self.dedup.find_similar_duplicate(temp_file)
+            if duplicate is not None:
+                logger.info(
+                    "此刻的心情: 自动采集跳过，检测到重复图片 "
+                    f"asset_id={duplicate.asset_id} image_url={sanitized_source}"
+                )
+                return {
+                    "success": False,
+                    "message": f"检测到重复资产: {duplicate.asset_id}",
+                    "duplicate_of": duplicate.asset_id,
+                }
             review_result = await self.review_remote_image(image_url)
             logger.info(
                 "此刻的心情: 图片审查完成 "
@@ -326,10 +442,11 @@ class PluginFacade:
             normalized_group = normalize_category_name(
                 tags[0] if tags else DEFAULT_CATEGORY
             )
-            result = await self.save_remote_image(
-                image_url=image_url,
+            result = await self.ingest_local_file(
+                source_path=str(temp_file),
                 group_name=normalized_group,
                 description=str(review_result.get("reason") or "").strip(),
+                preferred_name=temp_file.name,
                 source=f"auto_steal_group:{source_group}_user:{source_user}",
                 labels=tuple(tags) if tags else None,
             )
@@ -347,6 +464,7 @@ class PluginFacade:
             logger.error(f"此刻的心情: 自动采集失败: {exc}", exc_info=True)
             return {"success": False, "message": f"自动采集失败: {exc}"}
         finally:
+            self.downloader.cleanup(temp_file)
             async with self._inflight_lock:
                 self.inflight_sources.discard(image_url)
 
@@ -391,24 +509,21 @@ class PluginFacade:
     ) -> tuple[bool, str]:
         if not self.plugin_config.get("enable_auto_steal", True):
             return False, "enable_auto_steal=false"
+        only_store_emojis = self.plugin_config.get("only_store_emojis", False)
+        has_store_markers, matched_attrs = self._has_store_emoji_markers(
+            item, raw_image_data
+        )
+        if only_store_emojis:
+            if has_store_markers:
+                return True, f"only_store_emojis=true，命中特征字段: {', '.join(matched_attrs)}"
+            return False, "only_store_emojis=true 且图片不含 emoji_id/emoji_package_id/key"
         if self.plugin_config.get("steal_all_images", False):
             return True, "steal_all_images=true"
-        matched_attrs: list[str] = []
-        if raw_image_data:
-            matched_attrs.extend(
-                attr
-                for attr in ("emoji_id", "emoji_package_id", "key")
-                if raw_image_data.get(attr)
-            )
-        if not matched_attrs:
-            matched_attrs.extend(
-                attr
-                for attr in ("emoji_id", "emoji_package_id", "key")
-                if getattr(item, attr, None)
-            )
-        if matched_attrs:
-            return True, f"命中特征字段: {', '.join(matched_attrs)}"
-        return False, "steal_all_images=false 且图片不含 emoji_id/emoji_package_id/key"
+        if self._is_emoji_type_image(item, raw_image_data):
+            if matched_attrs:
+                return True, f"命中商城表情字段: {', '.join(matched_attrs)}"
+            return True, "命中表情类型图片特征"
+        return False, "steal_all_images=false 且图片未命中表情类型特征"
 
     def should_auto_collect_item(self, item) -> bool:
         should_collect, _ = self.explain_auto_collect_item(item)

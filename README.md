@@ -31,13 +31,13 @@
 
 插件内置了极具活力的**自动化库管策略**：
 
-- **咕嘎严选**：默认状态下，自动偷表情机制只会针对带有平台表情特征字段的图片触发审查。对 NapCat / aiocqhttp 这类适配器，会优先读取原始图片段中的 `emoji_id`、`emoji_package_id`、`key` 等字段来识别 QQ 官方表情；若开启 `steal_all_images`，则所有图片都进入审查流程。
+- **咕嘎严选**：默认状态下，自动偷表情机制会对“表情类型图片”触发审查。插件会优先读取原始图片段中的 `emoji_id`、`emoji_package_id`、`key`、`sub_type/subType`、`summary`、`type=imageType` 等特征来识别 QQ 商城表情或平台表情图片；若开启 `steal_all_images`，则所有图片都进入审查流程；若开启 `only_store_emojis`，则只处理商城表情。
 - **自动分类打标**：对收集到的图片使用内置 Prompt 的审查。如果判定为合法表情包，会将 LLM 总结出的标签 `Reason` 做归一化处理。
 - **自动清理**：如果启用了自动清理功能并设置了存储上限，系统会周期性删除发送次数最少的表情包。
 
 ## ⚠️ 平台兼容性说明
 
-- NapCat / aiocqhttp 场景下，QQ 官方表情通常会以带扩展字段的图片段上报，插件可以据此识别并自动审查。
+  - NapCat / aiocqhttp 场景下，QQ 官方表情通常会以带扩展字段的图片段上报，插件可以据此识别并自动审查。
 - `qq_official` 适配器下的“超大表情”等特殊消息，当前 AstrBot 通常会把它们解析成类似 `<faceType=4,...>` 的纯文本占位，而不是 `Image` 组件。
 - 在这种情况下，本插件拿不到真实图片，自然也无法完成自动偷图、图像审查或标签入库。这属于上游消息适配层限制，不是本插件单独能绕过的问题。
 
@@ -56,7 +56,8 @@
 
 ```yaml
 enable_auto_steal: true        # 是否启用自动偷取表情包功能
-steal_all_images: false        # 若设为 true，则不再只处理QQ官方表情包，而是审查所有图片
+steal_all_images: false        # 若设为 true，则审查所有图片；若为 false，则仅审查表情类型图片
+only_store_emojis: false       # 若设为 true，则只审查商城表情，优先级高于 steal_all_images
 enable_auto_cleanup: true      # 开启表情包的自动清理机制，删除x条使用次数最少的表情包
 max_stickers_per_message: 1    # 控制每条消息最多被替换出几张表情包（避免模型抽风全是图）
 max_prompt_tags: 30            # 每次注入给 LLM 的高频标签上限，避免提示词过长
