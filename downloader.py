@@ -69,3 +69,28 @@ class RemoteImageDownloader:
             temp_file_path.unlink(missing_ok=True)
         except Exception as exc:
             logger.warning(f"此刻的心情: 清理临时文件失败: {exc}")
+
+    def cleanup_temp_dir(self) -> int:
+        temp_dir = self.temp_dir
+        try:
+            if not temp_dir.exists():
+                return 0
+            if not temp_dir.is_dir():
+                logger.warning(
+                    f"此刻的心情: 临时目录路径存在但不是目录: {temp_dir}"
+                )
+                return 0
+            deleted = 0
+            for child in sorted(temp_dir.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+                try:
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+                        deleted += 1
+                    elif child.is_dir():
+                        child.rmdir()
+                except Exception as exc:
+                    logger.warning(f"此刻的心情: 清理临时目录项失败: {exc}")
+            return deleted
+        except OSError as exc:
+            logger.warning(f"此刻的心情: 扫描临时目录失败: {exc}")
+            return 0

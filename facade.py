@@ -19,7 +19,6 @@ from .models import (
     PluginPaths,
     StickerAssetDraft,
     StickerGroup,
-    StickerUsageEvent,
 )
 
 from .render import StickerRenderer
@@ -78,6 +77,19 @@ class PluginFacade:
         )
 
     async def startup(self) -> None:
+        try:
+            deleted_temp_files = await asyncio.to_thread(
+                self.downloader.cleanup_temp_dir
+            )
+            if deleted_temp_files:
+                logger.info(
+                    f"此刻的心情: 启动时清理下载临时文件 {deleted_temp_files} 个"
+                )
+        except Exception:
+            logger.warning(
+                "此刻的心情: 启动时清理下载临时文件失败，但将继续初始化流程",
+                exc_info=True,
+            )
         await self.storage.initialize()
         stale_asset_ids = await self.storage.prune_missing_assets()
         if stale_asset_ids:
@@ -89,7 +101,6 @@ class PluginFacade:
             logger.info("此刻的心情: 启动时未发现失效资产")
         await self.dedup.initialize()
         await self._import_default_catalog()
-        await self._import_legacy_sqlite_if_present()
 
     async def shutdown(self) -> None:
         await self.storage.close()
@@ -119,6 +130,100 @@ class PluginFacade:
             return f"{parsed.scheme}://{parsed.netloc}{path}"
         path = Path(image_source)
         return f"local:{path.name or '[unknown]'}"
+
+    @staticmethod
+    def _normalize_text(value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @classmethod
+    def _has_store_emoji_markers(
+        cls, item, raw_image_data: dict | None = None
+    ) -> tuple[bool, list[str]]:
+        matched_attrs: list[str] = []
+        if raw_image_data:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if raw_image_data.get(attr)
+            )
+        if not matched_attrs:
+            matched_attrs.extend(
+                attr
+                for attr in ("emoji_id", "emoji_package_id", "key")
+                if getattr(item, attr, None)
+            )
+        return bool(matched_attrs), matched_attrs
+
+    @classmethod
+    def _is_emoji_type_image(cls, item, raw_image_data: dict | None = None) -> bool:
+        def _is_emoji_summary(summary: object) -> bool:
+            text = cls._normalize_text(summary).lower()
+            return bool(text) and (
+                "表情" in text or "emoji" in text or "sticker" in text
+            )
+
+        def _is_sub_type_emoji(sub_type: object) -> bool:
+            if sub_type in (1, "1"):
+                return True
+            try:
+                return int(sub_type) == 1
+            except Exception:
+                return False
+
+        has_store_markers, _ = cls._has_store_emoji_markers(item, raw_image_data)
+        if has_store_markers:
+            return True
+
+        candidate_payloads: list[dict] = []
+        if isinstance(raw_image_data, dict):
+            candidate_payloads.append(raw_image_data)
+
+        item_dict = getattr(item, "__dict__", None)
+        if isinstance(item_dict, dict):
+            candidate_payloads.append(item_dict)
+
+        try:
+            raw_dict = item.toDict()
+            if isinstance(raw_dict, dict):
+                data = raw_dict.get("data")
+                if isinstance(data, dict):
+                    candidate_payloads.append(data)
+                else:
+                    candidate_payloads.append(raw_dict)
+        except Exception:
+            pass
+
+        for payload in candidate_payloads:
+            sub_type = payload.get("sub_type")
+            if _is_sub_type_emoji(sub_type):
+                return True
+            sub_type = payload.get("subType")
+            if _is_sub_type_emoji(sub_type):
+                return True
+
+            summary = payload.get("summary")
+            if _is_emoji_summary(summary):
+                return True
+
+            image_type = cls._normalize_text(
+                payload.get("type")
+                or payload.get("imageType")
+                or payload.get("image_type")
+            ).lower()
+            if image_type in {"emoji", "sticker", "face", "meme"}:
+                return True
+
+            url = cls._normalize_text(payload.get("url"))
+            if "vip.qq.com/club/item/parcel" in url or "gxh.vip.qq.com" in url:
+                return True
+
+        sub_type = getattr(item, "subType", None)
+        if _is_sub_type_emoji(sub_type):
+            return True
+
+        return False
 
     @staticmethod
     def extract_image_segment_payloads(raw_message) -> list[dict]:
@@ -151,6 +256,12 @@ class PluginFacade:
                 return value
         return ""
 
+    @staticmethod
+    def _derive_preferred_name(image_url: str) -> str | None:
+        parsed = urlparse(image_url)
+        candidate = Path(parsed.path).name.strip()
+        return candidate or None
+
     async def _validate_image_file(self, image_path: Path) -> bool:
         return await asyncio.to_thread(self._validate_image_file_sync, image_path)
 
@@ -173,6 +284,29 @@ class PluginFacade:
         source: str = "manual",
     ) -> IngestResult:
         resolved = resolve_user_path(source_path)
+        return await self._ingest_resolved_file(
+            resolved=resolved,
+            group_name=group_name,
+            description=description,
+            preferred_name=preferred_name,
+            labels=labels,
+            source=source,
+            skip_validation=False,
+            skip_duplicate_check=False,
+        )
+
+    async def _ingest_resolved_file(
+        self,
+        resolved: Path,
+        group_name: str,
+        description: str = "",
+        preferred_name: str | None = None,
+        labels: tuple[str, ...] | None = None,
+        source: str = "manual",
+        *,
+        skip_validation: bool,
+        skip_duplicate_check: bool,
+    ) -> IngestResult:
         if not resolved.exists() or not resolved.is_file():
             return IngestResult(ok=False, message=f"图片不存在或不是文件: {resolved}")
         if resolved.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
@@ -182,17 +316,18 @@ class PluginFacade:
             )
         if not is_path_within_roots(resolved, self.allowed_image_roots):
             return IngestResult(ok=False, message=f"图片路径超出允许范围: {resolved}")
-        if not await self._validate_image_file(resolved):
+        if not skip_validation and not await self._validate_image_file(resolved):
             return IngestResult(ok=False, message=f"图片内容无效或已损坏: {resolved}")
         normalized_group = normalize_category_name(group_name)
         async with self._ingest_lock:
-            duplicate = await self.dedup.find_similar_duplicate(resolved)
-            if duplicate is not None:
-                return IngestResult(
-                    ok=False,
-                    message=f"检测到重复资产: {duplicate.asset_id}",
-                    duplicate_of=duplicate.asset_id,
-                )
+            if not skip_duplicate_check:
+                duplicate = await self.dedup.find_similar_duplicate(resolved)
+                if duplicate is not None:
+                    return IngestResult(
+                        ok=False,
+                        message=f"检测到重复资产: {duplicate.asset_id}",
+                        duplicate_of=duplicate.asset_id,
+                    )
             storage_key, original_name = await self.storage.import_file(
                 resolved, normalized_group, preferred_name
             )
@@ -294,17 +429,31 @@ class PluginFacade:
             logger.warning(
                 f"此刻的心情: 自动采集仅支持远程图片源，已跳过 image_url={sanitized_source}"
             )
-            async with self._inflight_lock:
-                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "自动采集仅支持远程图片 URL"}
         if not await self.can_accept_more_assets(
             self.plugin_config.get("max_stickers")
         ):
             logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
-            async with self._inflight_lock:
-                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "当前图片资产数量已达到上限"}
+        temp_file: Path | None = None
+        preferred_name = self._derive_preferred_name(image_url)
         try:
+            temp_file = await self.downloader.download(image_url)
+            if temp_file is None:
+                return {"success": False, "message": "下载图片失败"}
+            if not await self._validate_image_file(temp_file):
+                return {"success": False, "message": "图片内容无效或已损坏"}
+            duplicate = await self.dedup.find_similar_duplicate(temp_file)
+            if duplicate is not None:
+                logger.info(
+                    "此刻的心情: 自动采集跳过，检测到重复图片 "
+                    f"asset_id={duplicate.asset_id} image_url={sanitized_source}"
+                )
+                return {
+                    "success": False,
+                    "message": f"检测到重复资产: {duplicate.asset_id}",
+                    "duplicate_of": duplicate.asset_id,
+                }
             review_result = await self.review_remote_image(image_url)
             logger.info(
                 "此刻的心情: 图片审查完成 "
@@ -326,12 +475,15 @@ class PluginFacade:
             normalized_group = normalize_category_name(
                 tags[0] if tags else DEFAULT_CATEGORY
             )
-            result = await self.save_remote_image(
-                image_url=image_url,
+            result = await self._ingest_resolved_file(
+                resolved=temp_file,
                 group_name=normalized_group,
                 description=str(review_result.get("reason") or "").strip(),
+                preferred_name=preferred_name,
                 source=f"auto_steal_group:{source_group}_user:{source_user}",
                 labels=tuple(tags) if tags else None,
+                skip_validation=True,
+                skip_duplicate_check=True,
             )
             logger.info(
                 f"此刻的心情: 自动采集保存完成 ok={result.ok} "
@@ -347,6 +499,7 @@ class PluginFacade:
             logger.error(f"此刻的心情: 自动采集失败: {exc}", exc_info=True)
             return {"success": False, "message": f"自动采集失败: {exc}"}
         finally:
+            self.downloader.cleanup(temp_file)
             async with self._inflight_lock:
                 self.inflight_sources.discard(image_url)
 
@@ -391,24 +544,21 @@ class PluginFacade:
     ) -> tuple[bool, str]:
         if not self.plugin_config.get("enable_auto_steal", True):
             return False, "enable_auto_steal=false"
+        only_store_emojis = self.plugin_config.get("only_store_emojis", False)
+        has_store_markers, matched_attrs = self._has_store_emoji_markers(
+            item, raw_image_data
+        )
+        if only_store_emojis:
+            if has_store_markers:
+                return True, f"only_store_emojis=true，命中特征字段: {', '.join(matched_attrs)}"
+            return False, "only_store_emojis=true 且图片不含 emoji_id/emoji_package_id/key"
         if self.plugin_config.get("steal_all_images", False):
             return True, "steal_all_images=true"
-        matched_attrs: list[str] = []
-        if raw_image_data:
-            matched_attrs.extend(
-                attr
-                for attr in ("emoji_id", "emoji_package_id", "key")
-                if raw_image_data.get(attr)
-            )
-        if not matched_attrs:
-            matched_attrs.extend(
-                attr
-                for attr in ("emoji_id", "emoji_package_id", "key")
-                if getattr(item, attr, None)
-            )
-        if matched_attrs:
-            return True, f"命中特征字段: {', '.join(matched_attrs)}"
-        return False, "steal_all_images=false 且图片不含 emoji_id/emoji_package_id/key"
+        if self._is_emoji_type_image(item, raw_image_data):
+            if matched_attrs:
+                return True, f"命中商城表情字段: {', '.join(matched_attrs)}"
+            return True, "命中表情类型图片特征"
+        return False, "steal_all_images=false 且图片未命中表情类型特征"
 
     def should_auto_collect_item(self, item) -> bool:
         should_collect, _ = self.explain_auto_collect_item(item)
@@ -455,111 +605,3 @@ class PluginFacade:
                         )
             except Exception as exc:
                 logger.warning(f"此刻的心情: 读取默认分类描述失败: {exc}")
-
-    async def _import_legacy_sqlite_if_present(self) -> None:
-        if await self.storage.count_assets() > 0:
-            return
-        legacy_root = self.paths.plugin_dir.parent / "astrbot_plugin_angel_smile"
-        candidate_dbs = [
-            legacy_root / "data" / "memes.db",
-            legacy_root / "data" / "cleanroom" / "assets.sqlite3",
-        ]
-        legacy_db = next((path for path in candidate_dbs if path.exists()), None)
-        if legacy_db is None:
-            return
-        rows: list[dict[str, object]] = []
-        try:
-            import sqlite3
-
-            conn = sqlite3.connect(str(legacy_db))
-            conn.row_factory = sqlite3.Row
-            table_names = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-            }
-            if "memes" in table_names:
-                rows = [
-                    dict(row)
-                    for row in conn.execute(
-                        "SELECT meme_id, file_path, tags, source, usage_count, added_time FROM memes"
-                    ).fetchall()
-                ]
-            elif "assets" in table_names:
-                rows = [
-                    {
-                        "meme_id": row["asset_id"],
-                        "file_path": row["storage_key"],
-                        "tags": row["labels_json"],
-                        "source": row["source"],
-                        "usage_count": row["usage_count"],
-                        "added_time": row["created_at"],
-                    }
-                    for row in conn.execute(
-                        "SELECT asset_id, storage_key, labels_json, source, usage_count, created_at FROM assets"
-                    ).fetchall()
-                ]
-            conn.close()
-        except Exception as exc:
-            logger.warning(f"此刻的心情: 读取旧 SQLite 数据失败: {exc}")
-            return
-        imported = 0
-        for row in rows:
-            try:
-                raw_file_path = Path(str(row.get("file_path") or ""))
-                if raw_file_path.is_absolute():
-                    file_path = raw_file_path.resolve()
-                else:
-                    file_path = (legacy_root / raw_file_path).resolve()
-                if not file_path.exists() or not file_path.is_file():
-                    continue
-                duplicate = await self.dedup.find_similar_duplicate(file_path)
-                if duplicate is not None:
-                    continue
-                try:
-                    raw_tags = json.loads(str(row.get("tags") or "[]"))
-                except Exception:
-                    raw_tags = []
-                tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
-                category = normalize_category_name(
-                    tags[0] if tags else file_path.parent.name
-                )
-                storage_key, original_name = await self.storage.import_file(
-                    file_path, category
-                )
-                await self.storage.upsert_group(
-                    StickerGroup(name=category, description="")
-                )
-                asset = await self.storage.add_asset(
-                    StickerAssetDraft(
-                        group_name=category,
-                        storage_key=storage_key,
-                        original_name=original_name,
-                        mime_hint=file_path.suffix.lower(),
-                        description=", ".join(tags),
-                        source=str(
-                            row.get("source") or f"legacy_sqlite:{legacy_db.name}"
-                        ),
-                        labels=tuple(tags) if tags else (category,),
-                    )
-                )
-                usage_count = int(row.get("usage_count") or 0)
-                added_time = float(row.get("added_time") or time.time())
-                for _ in range(max(usage_count, 0)):
-                    await self.storage.record_usage(
-                        StickerUsageEvent(
-                            asset_id=asset.asset_id,
-                            scope_key="legacy-import",
-                            created_at=added_time,
-                        )
-                    )
-                await self.dedup.register_file(
-                    await self.storage.resolve_path(asset.storage_key),
-                    asset,
-                )
-                imported += 1
-            except Exception as exc:
-                logger.warning(f"此刻的心情: 导入旧 SQLite 资产失败: {exc}")
-        if imported:
-            logger.info(f"此刻的心情: 已从旧 SQLite 导入资产 {imported} 个")

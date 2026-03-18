@@ -62,7 +62,13 @@
   },
   "steal_all_images": {
     "description": "偷取所有图片",
-    "hint": "开启后，所有图片都会进入自动偷图审查；关闭时仅自动偷取QQ官方表情包。",
+    "hint": "开启后，所有图片都会进入自动偷图审查；关闭时仅自动偷取被识别为表情类型的图片。",
+    "type": "bool",
+    "default": false
+  },
+  "only_store_emojis": {
+    "description": "仅偷取商城表情",
+    "hint": "开启后，只自动偷取命中 emoji_id、emoji_package_id、key 等商城表情特征字段的图片。此项优先级高于 steal_all_images。",
     "type": "bool",
     "default": false
   }
