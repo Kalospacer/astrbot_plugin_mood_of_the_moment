@@ -60,16 +60,17 @@ class DHashDedupService:
     def hamming_distance(self, left: str, right: str) -> int:
         if not left or not right:
             return 64
-        max_len = max(len(left), len(right))
-        left_bits = bin(int(left, 16))[2:].zfill(max_len * 4)
-        right_bits = bin(int(right, 16))[2:].zfill(max_len * 4)
+        left_bits = bin(int(left, 16))[2:].zfill(64)
+        right_bits = bin(int(right, 16))[2:].zfill(64)
         return sum(a != b for a, b in zip(left_bits, right_bits))
 
     async def find_similar_duplicate(self, source_path: Path) -> StickerAsset | None:
         candidate_hash = await self.compute_dhash(source_path)
         if not candidate_hash:
             return None
-        for item in list(self.index.values()):
+        async with self._lock:
+            snapshot = list(self.index.values())
+        for item in snapshot:
             existing_path = await self.storage.resolve_path(item.storage_key)
             if not existing_path.exists():
                 continue

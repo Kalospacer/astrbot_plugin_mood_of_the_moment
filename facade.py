@@ -77,10 +77,18 @@ class PluginFacade:
         )
 
     async def startup(self) -> None:
-        deleted_temp_files = await asyncio.to_thread(self.downloader.cleanup_temp_dir)
-        if deleted_temp_files:
-            logger.info(
-                f"此刻的心情: 启动时清理下载临时文件 {deleted_temp_files} 个"
+        try:
+            deleted_temp_files = await asyncio.to_thread(
+                self.downloader.cleanup_temp_dir
+            )
+            if deleted_temp_files:
+                logger.info(
+                    f"此刻的心情: 启动时清理下载临时文件 {deleted_temp_files} 个"
+                )
+        except Exception:
+            logger.warning(
+                "此刻的心情: 启动时清理下载临时文件失败，但将继续初始化流程",
+                exc_info=True,
             )
         await self.storage.initialize()
         stale_asset_ids = await self.storage.prune_missing_assets()
@@ -248,6 +256,12 @@ class PluginFacade:
                 return value
         return ""
 
+    @staticmethod
+    def _derive_preferred_name(image_url: str) -> str | None:
+        parsed = urlparse(image_url)
+        candidate = Path(parsed.path).name.strip()
+        return candidate or None
+
     async def _validate_image_file(self, image_path: Path) -> bool:
         return await asyncio.to_thread(self._validate_image_file_sync, image_path)
 
@@ -270,6 +284,29 @@ class PluginFacade:
         source: str = "manual",
     ) -> IngestResult:
         resolved = resolve_user_path(source_path)
+        return await self._ingest_resolved_file(
+            resolved=resolved,
+            group_name=group_name,
+            description=description,
+            preferred_name=preferred_name,
+            labels=labels,
+            source=source,
+            skip_validation=False,
+            skip_duplicate_check=False,
+        )
+
+    async def _ingest_resolved_file(
+        self,
+        resolved: Path,
+        group_name: str,
+        description: str = "",
+        preferred_name: str | None = None,
+        labels: tuple[str, ...] | None = None,
+        source: str = "manual",
+        *,
+        skip_validation: bool,
+        skip_duplicate_check: bool,
+    ) -> IngestResult:
         if not resolved.exists() or not resolved.is_file():
             return IngestResult(ok=False, message=f"图片不存在或不是文件: {resolved}")
         if resolved.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
@@ -279,17 +316,18 @@ class PluginFacade:
             )
         if not is_path_within_roots(resolved, self.allowed_image_roots):
             return IngestResult(ok=False, message=f"图片路径超出允许范围: {resolved}")
-        if not await self._validate_image_file(resolved):
+        if not skip_validation and not await self._validate_image_file(resolved):
             return IngestResult(ok=False, message=f"图片内容无效或已损坏: {resolved}")
         normalized_group = normalize_category_name(group_name)
         async with self._ingest_lock:
-            duplicate = await self.dedup.find_similar_duplicate(resolved)
-            if duplicate is not None:
-                return IngestResult(
-                    ok=False,
-                    message=f"检测到重复资产: {duplicate.asset_id}",
-                    duplicate_of=duplicate.asset_id,
-                )
+            if not skip_duplicate_check:
+                duplicate = await self.dedup.find_similar_duplicate(resolved)
+                if duplicate is not None:
+                    return IngestResult(
+                        ok=False,
+                        message=f"检测到重复资产: {duplicate.asset_id}",
+                        duplicate_of=duplicate.asset_id,
+                    )
             storage_key, original_name = await self.storage.import_file(
                 resolved, normalized_group, preferred_name
             )
@@ -391,17 +429,14 @@ class PluginFacade:
             logger.warning(
                 f"此刻的心情: 自动采集仅支持远程图片源，已跳过 image_url={sanitized_source}"
             )
-            async with self._inflight_lock:
-                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "自动采集仅支持远程图片 URL"}
         if not await self.can_accept_more_assets(
             self.plugin_config.get("max_stickers")
         ):
             logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
-            async with self._inflight_lock:
-                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "当前图片资产数量已达到上限"}
         temp_file: Path | None = None
+        preferred_name = self._derive_preferred_name(image_url)
         try:
             temp_file = await self.downloader.download(image_url)
             if temp_file is None:
@@ -440,13 +475,15 @@ class PluginFacade:
             normalized_group = normalize_category_name(
                 tags[0] if tags else DEFAULT_CATEGORY
             )
-            result = await self.ingest_local_file(
-                source_path=str(temp_file),
+            result = await self._ingest_resolved_file(
+                resolved=temp_file,
                 group_name=normalized_group,
                 description=str(review_result.get("reason") or "").strip(),
-                preferred_name=temp_file.name,
+                preferred_name=preferred_name,
                 source=f"auto_steal_group:{source_group}_user:{source_user}",
                 labels=tuple(tags) if tags else None,
+                skip_validation=True,
+                skip_duplicate_check=True,
             )
             logger.info(
                 f"此刻的心情: 自动采集保存完成 ok={result.ok} "
