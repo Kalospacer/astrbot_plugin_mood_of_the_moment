@@ -129,21 +129,21 @@ class MoodPageApi:
             assets = await self.plugin.facade.storage.query_assets()
             filtered: list[StickerAsset] = []
             for asset in assets:
-                resolved = await self.plugin.facade.storage.resolve_path(asset.storage_key)
-                missing = not resolved.exists()
                 if group and asset.group_name != group:
                     continue
                 if tag and tag not in set(asset.labels or (asset.group_name,)):
                     continue
-                if status == "missing" and not missing:
-                    continue
+                if status == "missing":
+                    resolved = await self.plugin.facade.storage.resolve_path(asset.storage_key)
+                    if resolved.exists():
+                        continue
                 haystack = " ".join(
                     [
                         asset.asset_id,
                         asset.group_name,
                         asset.original_name,
-                        asset.description,
-                        asset.source,
+                        str(asset.description or ""),
+                        str(asset.source or ""),
                         " ".join(asset.labels),
                     ]
                 ).casefold()
@@ -413,9 +413,9 @@ class MoodPageApi:
             ),
             "usage_count": int(asset.usage_count or 0),
             "last_used_at": int(asset.last_used_at or 0),
-            "labels": list(asset.labels),
+            "labels": list(asset.labels or ()),
             "exists": exists,
-            "image_endpoint": f"/sticker/image_data?asset_id={quote(asset.asset_id, safe='')}",
+            "image_endpoint": f"{PAGE_API_PREFIX}/sticker/image_data?asset_id={quote(asset.asset_id, safe='')}",
         }
         if include_path:
             payload["file_path"] = str(resolved)

@@ -104,13 +104,19 @@ class DHashDedupService:
             await asyncio.to_thread(self._persist_index_sync)
 
     async def rebuild_index(self) -> int:
-        async with self._lock:
-            self.index = {}
-            await asyncio.to_thread(self._persist_index_sync)
+        new_index = {}
         for asset in await self.storage.query_assets():
             file_path = await self.storage.resolve_path(asset.storage_key)
-            await self.register_file(file_path, asset)
+            image_hash = await self.compute_dhash(file_path)
+            if image_hash:
+                new_index[asset.asset_id] = IndexedHash(
+                    asset_id=asset.asset_id,
+                    storage_key=asset.storage_key,
+                    dhash=image_hash,
+                )
         async with self._lock:
+            self.index = new_index
+            await asyncio.to_thread(self._persist_index_sync)
             return len(self.index)
 
     async def list_index_entries(self) -> list[IndexedHash]:

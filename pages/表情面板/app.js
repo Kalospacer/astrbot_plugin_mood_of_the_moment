@@ -173,10 +173,7 @@ async function loadStickers() {
   state.filters.sortBy = result.sort_by || sortBy;
   state.filters.sortOrder = result.sort_order || sortOrder;
   
-  const visibleIds = new Set(state.stickers.map((asset) => asset.asset_id));
-  for (const assetId of [...state.selectedIds]) {
-    if (!visibleIds.has(assetId)) state.selectedIds.delete(assetId);
-  }
+  // Selected IDs are preserved across pages to support multi-page bulk operations.
 }
 
 function renderAll() {

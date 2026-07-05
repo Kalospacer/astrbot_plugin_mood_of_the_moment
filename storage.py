@@ -323,21 +323,22 @@ class StickerStorage:
         original_name = asset.original_name
         current_path = self._resolve_path_sync(asset.storage_key)
 
-        if target_group != asset.group_name and current_path.exists():
+        if target_group != asset.group_name:
             target_dir = self.paths.stickers_dir / target_group
-            target_dir.mkdir(parents=True, exist_ok=True)
             safe_name = safe_filename(
                 original_name,
                 current_path.suffix or asset.mime_hint or ".jpg",
             )
             target_path = target_dir / safe_name
-            if target_path.exists() and target_path.resolve() != current_path.resolve():
-                target_path = (
-                    target_dir
-                    / f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
-                )
-            shutil.move(str(current_path), str(target_path))
-            self._cleanup_empty_parent_dirs_sync(current_path.parent)
+            if current_path.exists():
+                target_dir.mkdir(parents=True, exist_ok=True)
+                if target_path.exists() and target_path.resolve() != current_path.resolve():
+                    target_path = (
+                        target_dir
+                        / f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
+                    )
+                shutil.move(str(current_path), str(target_path))
+                self._cleanup_empty_parent_dirs_sync(current_path.parent)
             storage_key = str(target_path.relative_to(self.paths.stickers_dir)).replace(
                 "\\", "/"
             )
