@@ -418,7 +418,7 @@ class MoodPageApi:
             "image_endpoint": f"{PAGE_API_PREFIX}/sticker/image_data?asset_id={quote(asset.asset_id, safe='')}",
         }
         if include_path:
-            payload["file_path"] = str(resolved)
+            payload["file_path"] = asset.storage_key
         return payload
 
     async def _resolve_asset_image_path(self) -> Path | dict[str, str]:

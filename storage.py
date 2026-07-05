@@ -345,32 +345,38 @@ class StickerStorage:
             original_name = target_path.name
 
         next_labels = labels if labels is not None else asset.labels
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sticker_groups(name, description) VALUES(?, '')
-                ON CONFLICT(name) DO NOTHING
-                """,
-                (target_group,),
-            )
-            conn.execute(
-                """
-                UPDATE sticker_assets
-                SET group_name = ?, storage_key = ?, original_name = ?,
-                    description = ?, source = ?, labels_json = ?
-                WHERE asset_id = ?
-                """,
-                (
-                    target_group,
-                    storage_key,
-                    original_name,
-                    asset.description if description is None else description,
-                    asset.source if source is None else source,
-                    self._labels_to_json(next_labels),
-                    asset_id,
-                ),
-            )
-            conn.commit()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO sticker_groups(name, description) VALUES(?, '')
+                    ON CONFLICT(name) DO NOTHING
+                    """,
+                    (target_group,),
+                )
+                conn.execute(
+                    """
+                    UPDATE sticker_assets
+                    SET group_name = ?, storage_key = ?, original_name = ?,
+                        description = ?, source = ?, labels_json = ?
+                    WHERE asset_id = ?
+                    """,
+                    (
+                        target_group,
+                        storage_key,
+                        original_name,
+                        asset.description if description is None else description,
+                        asset.source if source is None else source,
+                        self._labels_to_json(next_labels),
+                        asset_id,
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            if target_group != asset.group_name and 'target_path' in locals() and target_path.exists() and not current_path.exists():
+                current_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(target_path), str(current_path))
+            raise
         return self._get_asset_sync(asset_id)
 
     async def count_assets(self) -> int:
