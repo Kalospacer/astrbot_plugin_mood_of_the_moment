@@ -415,7 +415,7 @@ class MoodPageApi:
             "last_used_at": int(asset.last_used_at or 0),
             "labels": list(asset.labels or ()),
             "exists": exists,
-            "image_endpoint": f"{PAGE_API_PREFIX}/sticker/image_data?asset_id={quote(asset.asset_id, safe='')}",
+            "image_endpoint": f"/sticker/image_data?asset_id={quote(asset.asset_id, safe='')}",
         }
         if include_path:
             payload["file_path"] = asset.storage_key
