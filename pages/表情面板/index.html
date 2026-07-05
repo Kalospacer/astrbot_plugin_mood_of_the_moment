@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>此刻的心情</title>
+  <link rel="stylesheet" href="./app.css?v=20260706-library1" />
+</head>
+<body>
+  <main class="shell">
+    <header class="app-header">
+      <div class="brand">
+        <span class="eyebrow">Sticker library</span>
+        <h1>此刻的心情</h1>
+      </div>
+      <div class="header-actions">
+        <button id="refreshBtn" type="button" class="ghost">刷新</button>
+        <button id="selectModeBtn" type="button" class="ghost">选择</button>
+        <button id="openImportBtn" type="button" class="primary">添加表情</button>
+      </div>
+    </header>
+
+    <section id="stats" class="stats"></section>
+
+    <section class="filter-panel">
+      <div class="search-row">
+        <input id="searchInput" type="search" placeholder="搜索标签、文件名、来源、asset_id" />
+        <select id="statusFilter" aria-label="状态筛选">
+          <option value="">全部状态</option>
+          <option value="missing">缺失文件</option>
+        </select>
+        <select id="sortBySelect" aria-label="排序字段">
+          <option value="created_at">添加时间</option>
+          <option value="usage_count">使用次数</option>
+          <option value="last_used_at">最近使用</option>
+          <option value="original_name">文件名</option>
+        </select>
+        <select id="sortOrderSelect" aria-label="排序方向">
+          <option value="desc">降序</option>
+          <option value="asc">升序</option>
+        </select>
+        <button id="pruneBtn" type="button" class="ghost danger-text">清理缺失</button>
+      </div>
+      <div class="tag-row">
+        <button id="clearFilterBtn" type="button" class="tag-chip is-active">全部标签</button>
+        <div id="tagRail" class="tag-rail"></div>
+      </div>
+    </section>
+
+    <section class="library">
+      <div id="selectionBar" class="selection-bar" hidden>
+        <span id="selectionCount">已选 0 张</span>
+        <button id="bulkDeleteBtn" type="button" class="danger">删除选中</button>
+        <button id="cancelSelectBtn" type="button" class="ghost">退出选择</button>
+      </div>
+      <div id="stickerWall" class="sticker-wall"></div>
+      <div class="pager">
+        <button id="prevPageBtn" type="button" class="ghost">上一页</button>
+        <span id="pageInfo"></span>
+        <button id="nextPageBtn" type="button" class="ghost">下一页</button>
+      </div>
+    </section>
+  </main>
+
+  <aside id="detailDrawer" class="drawer" aria-hidden="true">
+    <div class="drawer-head">
+      <div>
+        <span class="eyebrow">Edit sticker</span>
+        <h2>编辑表情</h2>
+      </div>
+      <button id="closeDetailBtn" type="button" class="ghost">关闭</button>
+    </div>
+    <div id="detailPanel"></div>
+  </aside>
+
+  <section id="importModal" class="modal" hidden>
+    <button class="modal-backdrop" type="button" data-close-import aria-label="关闭"></button>
+    <form id="importForm" class="modal-panel">
+      <div class="modal-head">
+        <div>
+          <span class="eyebrow">Add sticker</span>
+          <h2>添加表情</h2>
+        </div>
+        <button id="closeImportBtn" type="button" class="ghost">关闭</button>
+      </div>
+      <label class="file-drop">
+        <input id="fileInput" name="file" type="file" accept="image/*" />
+        <span>选择图片文件</span>
+        <small id="fileName">也可以在下面粘贴 http/https 图片地址或服务器本地路径</small>
+      </label>
+      <label>
+        <span>图片地址或本地路径</span>
+        <input name="image_source" placeholder="https://... 或 C:\path\image.png" />
+      </label>
+      <div class="form-grid">
+        <label>
+          <span>标签</span>
+          <input name="labels" placeholder="开心, 摸鱼, 二次元" />
+        </label>
+        <label>
+          <span>分组</span>
+          <input name="group_name" placeholder="默认 unsorted" value="unsorted" />
+        </label>
+      </div>
+      <label>
+        <span>描述</span>
+        <textarea name="description" placeholder="可选，写给以后搜索用"></textarea>
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="ghost" data-close-import>取消</button>
+        <button type="submit" class="primary">添加</button>
+      </div>
+    </form>
+  </section>
+
+  <div id="toast" class="toast" aria-live="polite"></div>
+  <script src="./app.js?v=20260706-library1"></script>
+</body>
+</html>
