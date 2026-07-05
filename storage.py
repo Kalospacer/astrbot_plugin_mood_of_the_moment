@@ -287,6 +287,91 @@ class StickerStorage:
             conn.commit()
         return asset
 
+    async def update_asset_metadata(
+        self,
+        asset_id: str,
+        *,
+        group_name: str | None = None,
+        description: str | None = None,
+        source: str | None = None,
+        labels: tuple[str, ...] | None = None,
+    ) -> StickerAsset | None:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._update_asset_metadata_sync,
+                asset_id,
+                group_name,
+                description,
+                source,
+                labels,
+            )
+
+    def _update_asset_metadata_sync(
+        self,
+        asset_id: str,
+        group_name: str | None = None,
+        description: str | None = None,
+        source: str | None = None,
+        labels: tuple[str, ...] | None = None,
+    ) -> StickerAsset | None:
+        asset = self._get_asset_sync(asset_id)
+        if asset is None:
+            return None
+
+        target_group = (group_name or asset.group_name).strip() or asset.group_name
+        storage_key = asset.storage_key
+        original_name = asset.original_name
+        current_path = self._resolve_path_sync(asset.storage_key)
+
+        if target_group != asset.group_name and current_path.exists():
+            target_dir = self.paths.stickers_dir / target_group
+            target_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = safe_filename(
+                original_name,
+                current_path.suffix or asset.mime_hint or ".jpg",
+            )
+            target_path = target_dir / safe_name
+            if target_path.exists() and target_path.resolve() != current_path.resolve():
+                target_path = (
+                    target_dir
+                    / f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
+                )
+            shutil.move(str(current_path), str(target_path))
+            self._cleanup_empty_parent_dirs_sync(current_path.parent)
+            storage_key = str(target_path.relative_to(self.paths.stickers_dir)).replace(
+                "\\", "/"
+            )
+            original_name = target_path.name
+
+        next_labels = labels if labels is not None else asset.labels
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sticker_groups(name, description) VALUES(?, '')
+                ON CONFLICT(name) DO NOTHING
+                """,
+                (target_group,),
+            )
+            conn.execute(
+                """
+                UPDATE sticker_assets
+                SET group_name = ?, storage_key = ?, original_name = ?,
+                    description = ?, source = ?, labels_json = ?
+                WHERE asset_id = ?
+                """,
+                (
+                    target_group,
+                    storage_key,
+                    original_name,
+                    asset.description if description is None else description,
+                    asset.source if source is None else source,
+                    self._labels_to_json(next_labels),
+                    asset_id,
+                ),
+            )
+            conn.commit()
+        return self._get_asset_sync(asset_id)
+
     async def count_assets(self) -> int:
         return await asyncio.to_thread(self._count_assets_sync)
 
@@ -408,8 +493,16 @@ class StickerStorage:
     def _delete_file_sync(self, storage_key: str) -> None:
         target = self._resolve_path_sync(storage_key)
         target.unlink(missing_ok=True)
-        parent = target.parent
-        while parent != self.paths.stickers_dir and parent.exists():
+        self._cleanup_empty_parent_dirs_sync(target.parent)
+
+    def _cleanup_empty_parent_dirs_sync(self, parent: Path) -> None:
+        stickers_root = self.paths.stickers_dir.resolve()
+        try:
+            parent = parent.resolve()
+            parent.relative_to(stickers_root)
+        except ValueError:
+            return
+        while parent != stickers_root and parent.exists():
             try:
                 next(parent.iterdir())
                 break

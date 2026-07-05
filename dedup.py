@@ -103,6 +103,20 @@ class DHashDedupService:
             )
             await asyncio.to_thread(self._persist_index_sync)
 
+    async def rebuild_index(self) -> int:
+        async with self._lock:
+            self.index = {}
+            await asyncio.to_thread(self._persist_index_sync)
+        for asset in await self.storage.query_assets():
+            file_path = await self.storage.resolve_path(asset.storage_key)
+            await self.register_file(file_path, asset)
+        async with self._lock:
+            return len(self.index)
+
+    async def list_index_entries(self) -> list[IndexedHash]:
+        async with self._lock:
+            return list(self.index.values())
+
     async def unregister_asset(self, asset: StickerAsset) -> None:
         async with self._lock:
             if self.index.pop(asset.asset_id, None) is not None:

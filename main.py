@@ -12,6 +12,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .constants import PLUGIN_NAME, PLUGIN_PACKAGE_NAME, PLUGIN_VERSION, STEAL_TOOL_NAME
 from .facade import PluginFacade
 from .models import PluginPaths
+from .page_api import MoodPageApi
 from .tooling import StealMemesTool
 
 
@@ -46,6 +47,7 @@ class MoodOfTheMomentPlugin(Star):
             paths=self.paths, context=context, plugin_config=self.config
         )
         self.steal_tool = StealMemesTool(facade=self.facade)
+        self.page_api = MoodPageApi(self)
         self._auto_collect_tasks: set[asyncio.Task] = set()
         StarTools.unregister_llm_tool(STEAL_TOOL_NAME)
         self.context.add_llm_tools(self.steal_tool)
@@ -69,6 +71,7 @@ class MoodOfTheMomentPlugin(Star):
         task.add_done_callback(self._finalize_task)
 
     async def initialize(self):
+        self.page_api.register_routes()
         await self.facade.startup()
         logger.info(f"{PLUGIN_NAME}: 插件已初始化")
 
