@@ -50,7 +50,7 @@ class StealMemesTool(FunctionTool):
                 },
                 "save_name": {
                     "type": "string",
-                    "description": "可选，保存后的文件名，不含路径。",
+                    "description": "可选，保存后的文件名，不含路径。建议按「角色-动作」格式，如：金色猫娘-困倦。",
                 },
             },
             "required": ["image_path", "category"],

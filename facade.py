@@ -436,7 +436,6 @@ class PluginFacade:
             logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
             return {"success": False, "message": "当前图片资产数量已达到上限"}
         temp_file: Path | None = None
-        preferred_name = self._derive_preferred_name(image_url)
         try:
             temp_file = await self.downloader.download(image_url)
             if temp_file is None:
@@ -459,7 +458,8 @@ class PluginFacade:
                 "此刻的心情: 图片审查完成 "
                 f"should_steal={review_result.get('should_steal')} "
                 f"reason={review_result.get('reason')} "
-                f"tags={review_result.get('tags')}"
+                f"tags={review_result.get('tags')} "
+                f"filename={review_result.get('filename')}"
             )
             if not review_result.get("should_steal"):
                 return {
@@ -472,6 +472,10 @@ class PluginFacade:
                 for tag in review_result.get("tags", [])
                 if str(tag).strip()
             ]
+            preferred_name = (
+                str(review_result.get("filename") or "").strip()
+                or self._derive_preferred_name(image_url)
+            )
             normalized_group = normalize_category_name(
                 tags[0] if tags else DEFAULT_CATEGORY
             )
