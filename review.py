@@ -67,25 +67,28 @@ class ReviewService:
                 "should_steal": False,
                 "reason": "未找到可用的 LLM 提供商，无法审查图片",
                 "tags": [],
+                "filename": "",
             }
         try:
             response = await provider.text_chat(
                 prompt=self._get_review_prompt(), image_urls=[image_url]
             )
             if response is None or not hasattr(response, "completion_text"):
-                return {"should_steal": False, "reason": "LLM 返回结果为空", "tags": []}
+                return {"should_steal": False, "reason": "LLM 返回结果为空", "tags": [], "filename": ""}
             result_text = response.completion_text.strip()
             json_match = re.search(r"\{[^}]*\}", result_text, re.DOTALL)
             if json_match:
                 try:
                     result = json.loads(json_match.group())
                     tags = result.get("tags", [])
+                    filename = str(result.get("filename", "") or "").strip()
                     return {
                         "should_steal": self._parse_should_steal(
                             result.get("should_steal", False)
                         ),
                         "reason": str(result.get("reason", "未知")),
                         "tags": list(tags) if isinstance(tags, list) else [],
+                        "filename": filename,
                     }
                 except json.JSONDecodeError:
                     pass
@@ -98,7 +101,8 @@ class ReviewService:
                 "should_steal": should_steal,
                 "reason": result_text[:200] if not should_steal else "判断为表情包",
                 "tags": tags,
+                "filename": "",
             }
         except Exception as exc:
             logger.error(f"此刻的心情: LLM 审查图片失败: {exc}", exc_info=True)
-            return {"should_steal": False, "reason": f"审查过程出错: {exc}", "tags": []}
+            return {"should_steal": False, "reason": f"审查过程出错: {exc}", "tags": [], "filename": ""}

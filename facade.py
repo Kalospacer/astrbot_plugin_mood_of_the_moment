@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -436,7 +437,6 @@ class PluginFacade:
             logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
             return {"success": False, "message": "当前图片资产数量已达到上限"}
         temp_file: Path | None = None
-        preferred_name = self._derive_preferred_name(image_url)
         try:
             temp_file = await self.downloader.download(image_url)
             if temp_file is None:
@@ -459,7 +459,8 @@ class PluginFacade:
                 "此刻的心情: 图片审查完成 "
                 f"should_steal={review_result.get('should_steal')} "
                 f"reason={review_result.get('reason')} "
-                f"tags={review_result.get('tags')}"
+                f"tags={review_result.get('tags')} "
+                f"filename={review_result.get('filename')}"
             )
             if not review_result.get("should_steal"):
                 return {
@@ -472,6 +473,15 @@ class PluginFacade:
                 for tag in review_result.get("tags", [])
                 if str(tag).strip()
             ]
+            llm_filename = str(review_result.get("filename") or "").strip()
+            if llm_filename:
+                # 防御路径穿越和非法字符，保留原始扩展名
+                base_name = Path(llm_filename).name
+                base_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", base_name).strip()
+                orig_suffix = Path(urlparse(image_url).path).suffix or ".jpg"
+                preferred_name = f"{base_name}{orig_suffix}" if base_name else self._derive_preferred_name(image_url)
+            else:
+                preferred_name = self._derive_preferred_name(image_url)
             normalized_group = normalize_category_name(
                 tags[0] if tags else DEFAULT_CATEGORY
             )

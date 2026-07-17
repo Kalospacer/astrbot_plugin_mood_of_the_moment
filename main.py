@@ -8,6 +8,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.agent.message import TextPart
 
 from .constants import PLUGIN_NAME, PLUGIN_PACKAGE_NAME, PLUGIN_VERSION, STEAL_TOOL_NAME
 from .facade import PluginFacade
@@ -16,11 +17,13 @@ from .page_api import MoodPageApi
 from .tooling import StealMemesTool
 
 
-def _append_summary(req: ProviderRequest, summary: str) -> None:
+def _inject_sticker_reminder(req: ProviderRequest, summary: str) -> None:
+    """将动态标签库作为临时用户消息内容注入，不修改 system_prompt。"""
     if not summary.strip():
         return
-    base = (req.system_prompt or "").strip()
-    req.system_prompt = f"{base}\n\n{summary}".strip()
+    if not req.extra_user_content_parts:
+        req.extra_user_content_parts = []
+    req.extra_user_content_parts.append(TextPart(text=summary).mark_as_temp())
 
 
 @register(
@@ -130,7 +133,7 @@ class MoodOfTheMomentPlugin(Star):
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
         _ = event
-        _append_summary(req, await self.facade.build_llm_summary())
+        _inject_sticker_reminder(req, await self.facade.build_llm_summary())
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):

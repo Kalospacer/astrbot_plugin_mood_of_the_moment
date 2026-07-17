@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 import random
 import re
+import time
 from difflib import SequenceMatcher
 from itertools import combinations
 
@@ -21,6 +23,11 @@ class StickerRenderer:
         self.storage = storage
         self.max_stickers_per_message = max(0, int(max_stickers_per_message))
         self.max_prompt_tags = max(0, int(max_prompt_tags))
+        # 标签展示冷却：记录每个标签最近一次出现时间，以及最近窗口内的标签
+        self._tag_last_shown_at: dict[str, float] = {}
+        # 窗口大小至少覆盖 max_prompt_tags 的两倍，避免单轮展示过多导致冷却记录被挤出
+        self._recent_tag_window: deque[str] = deque(maxlen=max(100, self.max_prompt_tags * 2))
+
 
     async def build_sticker_list(self) -> str:
         all_tags = await self.storage.get_all_tags()
@@ -32,12 +39,18 @@ class StickerRenderer:
         all_tags = await self.storage.get_tag_index()
         if not all_tags:
             return ""
-        tag_counts = []
-        for tag, meme_ids in all_tags.items():
-            tag_counts.append((tag, len(meme_ids)))
-        tag_counts.sort(key=lambda item: item[1], reverse=True)
-        top_tags = [tag for tag, _ in tag_counts[: self.max_prompt_tags]]
-        tag_list = ", ".join(f":{tag}:" for tag in top_tags)
+        tag_counts = [(tag, len(meme_ids)) for tag, meme_ids in all_tags.items()]
+        selected_tags = self._select_weighted_tags(tag_counts, self.max_prompt_tags)
+        if not selected_tags:
+            return ""
+
+        # 更新展示历史
+        now = time.time()
+        for tag in selected_tags:
+            self._tag_last_shown_at[tag] = now
+            self._recent_tag_window.append(tag)
+
+        tag_list = ", ".join(f":{tag}:" for tag in selected_tags)
         return (
             "<表情包标签库>\n"
             f"可用标签：{tag_list}\n"
@@ -45,6 +58,90 @@ class StickerRenderer:
             "提示：标签越多，匹配越精准；没有匹配则静默删除标签不发送表情包\n"
             "</表情包标签库>"
         )
+
+    def _select_weighted_tags(
+        self, tag_counts: list[tuple[str, int]], max_tags: int
+    ) -> list[str]:
+        """
+        低频标签加权 + 保留常用标签 + 最近展示冷却 + 时间衰减。
+
+        - 20% slots 保留最高频标签（常用标签不掉出提示）
+        - 其余 slots 按 1/count 加权无放回采样，低频标签权重更高
+        - 最近展示过的标签权重降低
+        - 久未展示的标签按时间获得小幅加成
+        """
+        if not tag_counts:
+            return []
+
+        max_tags = min(max_tags, len(tag_counts))
+        if max_tags <= 0:
+            return []
+
+        head_count = max(1, max_tags // 5)
+        tail_count = max_tags - head_count
+
+        # 常用标签：使用次数最高的 head_count 个
+        sorted_by_count_desc = sorted(tag_counts, key=lambda item: -item[1])
+        head_tags = [tag for tag, _ in sorted_by_count_desc[:head_count]]
+        head_set = set(head_tags)
+
+        # 低频候选
+        tail_candidates = [
+            (tag, count) for tag, count in tag_counts if tag not in head_set
+        ]
+        selected_tail: list[str] = []
+
+        if tail_candidates and tail_count > 0:
+            now = time.time()
+            weights: list[float] = []
+            for tag, count in tail_candidates:
+                base_weight = 1.0 / max(1, count)
+                if tag in self._recent_tag_window:
+                    weight = base_weight * 0.3
+                else:
+                    age_hours = max(0.0, (now - self._tag_last_shown_at.get(tag, 0.0)) / 3600.0)
+                    boost = min(2.0, 1.0 + age_hours / 24.0)
+                    weight = base_weight * boost
+                weights.append(weight)
+
+            selected_indices = self._weighted_sample_without_replacement(
+                tail_candidates, weights, tail_count
+            )
+            selected_tail = [tail_candidates[i][0] for i in selected_indices]
+
+        return head_tags + selected_tail
+
+    def _weighted_sample_without_replacement(
+        self,
+        items: list[tuple[str, int]],
+        weights: list[float],
+        k: int,
+    ) -> list[int]:
+        """无放回加权随机采样，返回选中的下标列表。"""
+        if k >= len(items):
+            return list(range(len(items)))
+
+        selected: list[int] = []
+        remaining = list(range(len(items)))
+        for _ in range(k):
+            if not remaining:
+                break
+            total = sum(weights[i] for i in remaining)
+            if total <= 0:
+                idx = random.choice(remaining)
+            else:
+                r = random.uniform(0, total)
+                cumulative = 0.0
+                idx = remaining[-1]
+                for i in remaining:
+                    cumulative += weights[i]
+                    if cumulative >= r:
+                        idx = i
+                        break
+            selected.append(idx)
+            remaining.remove(idx)
+        return selected
+
 
     def parse_markers(self, text: str) -> list[ParsedMarker]:
         markers: list[ParsedMarker] = []
@@ -170,16 +267,16 @@ class StickerRenderer:
         scored_assets.sort(
             key=lambda item: (
                 item[0],
-                int(item[1].get("usage_count") or 0) * -1,
-                float(item[1].get("added_time") or 0.0),
+                -float(item[1].get("last_used_at") or 0.0),
+                -int(item[1].get("usage_count") or 0),
             ),
+            # 同分情况下：last_used_at 越旧越优先，usage_count 越低越优先，实现轮询
             reverse=True,
         )
         top_score = scored_assets[0][0]
         if top_score <= 0:
             return None
-        top_assets = [asset for score, asset in scored_assets if score == top_score]
-        return random.choice(top_assets) if top_assets else None
+        return scored_assets[0][1]
 
     async def _select_best_asset(self, requested_tags: tuple[str, ...]) -> dict | None:
         """

@@ -20,6 +20,8 @@ const state = {
     total: 0,
   },
   imageCache: new Map(),
+  config: null,
+  providers: [],
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -346,10 +348,118 @@ function formValue(form, name) {
   return String(new FormData(form).get(name) || "").trim();
 }
 
+function renderSettingsForm() {
+  const body = $("#settingsBody");
+  if (!body) return;
+  if (!state.config) {
+    body.innerHTML = `<div class="empty">加载失败</div>`;
+    return;
+  }
+  const c = state.config;
+  const providers = state.providers || [];
+  const providerOptions = [
+    `<option value="">默认（留空）</option>`,
+    ...providers.map(p => `<option value="${escapeHtml(p.id)}" ${c.tag_provider_id === p.id ? "selected" : ""}>${escapeHtml(p.name || p.id)}</option>`)
+  ].join("");
+
+  body.innerHTML = `
+    <label>
+      <span>审查 LLM Provider</span>
+      <select name="tag_provider_id">${providerOptions}</select>
+    </label>
+    <label>
+      <span>审查 System Prompt</span>
+      <textarea name="review_system_prompt" rows="6">${escapeHtml(c.review_system_prompt || "")}</textarea>
+    </label>
+    <div class="form-grid">
+      <label>
+        <span>最大表情包数量</span>
+        <input name="max_stickers" type="number" min="0" value="${escapeHtml(c.max_stickers ?? 100)}" />
+      </label>
+      <label>
+        <span>每条消息最多贴纸</span>
+        <input name="max_stickers_per_message" type="number" min="0" max="10" value="${escapeHtml(c.max_stickers_per_message ?? 1)}" />
+      </label>
+    </div>
+    <div class="form-grid">
+      <label>
+        <span>提示标签数量上限</span>
+        <input name="max_prompt_tags" type="number" min="0" max="100" value="${escapeHtml(c.max_prompt_tags ?? 30)}" />
+      </label>
+      <label>
+        <span>清理间隔（小时）</span>
+        <input name="cleanup_interval_hours" type="number" min="1" value="${escapeHtml(c.cleanup_interval_hours ?? 1)}" />
+      </label>
+    </div>
+    <div class="form-grid">
+      <label>
+        <span>每次清理数量</span>
+        <input name="cleanup_count" type="number" min="1" value="${escapeHtml(c.cleanup_count ?? 5)}" />
+      </label>
+      <label>
+        <span>最小保留数量</span>
+        <input name="min_stickers_to_keep" type="number" min="0" value="${escapeHtml(c.min_stickers_to_keep ?? 0)}" />
+      </label>
+    </div>
+    <label class="checkbox-row">
+      <input name="enable_auto_steal" type="checkbox" ${c.enable_auto_steal ? "checked" : ""} />
+      <span>启用自动偷图</span>
+    </label>
+    <label class="checkbox-row">
+      <input name="enable_auto_cleanup" type="checkbox" ${c.enable_auto_cleanup ? "checked" : ""} />
+      <span>启用自动清理</span>
+    </label>
+    <label class="checkbox-row">
+      <input name="steal_all_images" type="checkbox" ${c.steal_all_images ? "checked" : ""} />
+      <span>偷取所有图片</span>
+    </label>
+    <label class="checkbox-row">
+      <input name="only_store_emojis" type="checkbox" ${c.only_store_emojis ? "checked" : ""} />
+      <span>仅偷取商城表情</span>
+    </label>
+  `;
+}
+
+async function openSettings() {
+  const modal = $("#settingsModal");
+  if (!modal) return;
+  modal.hidden = false;
+  const body = $("#settingsBody");
+  if (body) body.innerHTML = `<div class="empty">加载中...</div>`;
+  try {
+    const result = await fetchJson("/config");
+    state.config = result.config || {};
+    state.providers = result.providers || [];
+    renderSettingsForm();
+  } catch (err) {
+    if (body) body.innerHTML = `<div class="empty">${escapeHtml(err.message || "加载配置失败")}</div>`;
+  }
+}
+
+function collectSettingsPayload() {
+  const form = $("#settingsForm");
+  if (!form) return null;
+  const fd = new FormData(form);
+  return {
+    tag_provider_id: String(fd.get("tag_provider_id") || ""),
+    review_system_prompt: String(fd.get("review_system_prompt") || ""),
+    max_stickers: parseInt(fd.get("max_stickers"), 10) || 0,
+    max_stickers_per_message: parseInt(fd.get("max_stickers_per_message"), 10) || 0,
+    max_prompt_tags: parseInt(fd.get("max_prompt_tags"), 10) || 0,
+    cleanup_interval_hours: parseInt(fd.get("cleanup_interval_hours"), 10) || 1,
+    cleanup_count: parseInt(fd.get("cleanup_count"), 10) || 1,
+    min_stickers_to_keep: parseInt(fd.get("min_stickers_to_keep"), 10) || 0,
+    enable_auto_steal: fd.get("enable_auto_steal") === "on",
+    enable_auto_cleanup: fd.get("enable_auto_cleanup") === "on",
+    steal_all_images: fd.get("steal_all_images") === "on",
+    only_store_emojis: fd.get("only_store_emojis") === "on",
+  };
+}
+
 // Global click handler
 document.addEventListener("click", async (event) => {
   const target = event.target;
-  
+
   // Drawer close
   if (target.id === "closeDetailBtn") {
     $("#detailDrawer").setAttribute("aria-hidden", "true");
@@ -363,6 +473,16 @@ document.addEventListener("click", async (event) => {
   }
   if (target.id === "closeImportBtn" || target.matches("[data-close-import]")) {
     $("#importModal").hidden = true;
+    return;
+  }
+
+  // Settings modal
+  if (target.id === "openSettingsBtn") {
+    await openSettings();
+    return;
+  }
+  if (target.id === "closeSettingsBtn" || target.matches("[data-close-settings]")) {
+    $("#settingsModal").hidden = true;
     return;
   }
 
@@ -602,6 +722,31 @@ $("#importForm")?.addEventListener("submit", async (event) => {
     showToast(err.message || "上传失败", "error");
   } finally {
     button.disabled = false;
+  }
+});
+
+// Settings form submit
+document.addEventListener("submit", async (event) => {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement) || form.id !== "settingsForm") return;
+  event.preventDefault();
+  const button = form.querySelector("button[type='submit']");
+  if (button) button.disabled = true;
+  try {
+    const payload = collectSettingsPayload();
+    if (!payload) return;
+    await fetchJson("/config/update", {
+      method: "POST",
+      body: payload,
+    });
+    $("#settingsModal").hidden = true;
+    showToast("配置已保存");
+    await loadOverview();
+    renderStats();
+  } catch (err) {
+    showToast(err.message || "保存失败", "error");
+  } finally {
+    if (button) button.disabled = false;
   }
 });
 
