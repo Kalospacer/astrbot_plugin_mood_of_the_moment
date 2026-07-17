@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -472,10 +473,15 @@ class PluginFacade:
                 for tag in review_result.get("tags", [])
                 if str(tag).strip()
             ]
-            preferred_name = (
-                str(review_result.get("filename") or "").strip()
-                or self._derive_preferred_name(image_url)
-            )
+            llm_filename = str(review_result.get("filename") or "").strip()
+            if llm_filename:
+                # 防御路径穿越和非法字符，保留原始扩展名
+                base_name = Path(llm_filename).name
+                base_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", base_name).strip()
+                orig_suffix = Path(urlparse(image_url).path).suffix or ".jpg"
+                preferred_name = f"{base_name}{orig_suffix}" if base_name else self._derive_preferred_name(image_url)
+            else:
+                preferred_name = self._derive_preferred_name(image_url)
             normalized_group = normalize_category_name(
                 tags[0] if tags else DEFAULT_CATEGORY
             )

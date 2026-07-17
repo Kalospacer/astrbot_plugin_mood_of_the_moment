@@ -392,15 +392,38 @@ class MoodPageApi:
 
     async def get_config(self) -> dict[str, Any]:
         try:
-            config = dict(self.plugin.config)
+            raw_config = self.plugin.config
+            if hasattr(raw_config, "data") and isinstance(raw_config.data, dict):
+                config = dict(raw_config.data)
+            elif isinstance(raw_config, dict):
+                config = dict(raw_config)
+            else:
+                config = {}
+                for key in (
+                    "tag_provider_id", "review_system_prompt", "max_stickers",
+                    "max_stickers_per_message", "max_prompt_tags", "enable_auto_steal",
+                    "cleanup_interval_hours", "cleanup_count", "enable_auto_cleanup",
+                    "min_stickers_to_keep", "steal_all_images", "only_store_emojis",
+                ):
+                    try:
+                        config[key] = raw_config.get(key)
+                    except Exception:
+                        config[key] = None
             providers = []
             try:
-                provider_insts = self.plugin.context.get_all_providers()
-                for prov in provider_insts:
-                    prov_id = getattr(prov, "provider_id", "") or getattr(prov, "id", "")
-                    prov_name = getattr(prov, "provider_name", "") or getattr(prov, "name", "") or prov_id
-                    if prov_id:
-                        providers.append({"id": str(prov_id), "name": str(prov_name)})
+                provider_manager = getattr(self.plugin.context, "provider_manager", None)
+                if provider_manager is not None:
+                    providers_config = getattr(provider_manager, "providers_config", [])
+                    for provider in providers_config:
+                        if not isinstance(provider, dict):
+                            continue
+                        prov_id = provider.get("id", "")
+                        prov_name = provider.get("name", "") or prov_id
+                        prov_type = provider.get("type", "")
+                        model = provider.get("model", "")
+                        if prov_id:
+                            label = f"{prov_name} ({prov_type}/{model})" if model else f"{prov_name} ({prov_type})"
+                            providers.append({"id": str(prov_id), "name": label})
             except Exception as exc:
                 logger.warning(f"{PLUGIN_NAME}: 获取 provider 列表失败: {exc}")
             return self._ok({"config": config, "providers": providers})

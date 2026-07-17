@@ -25,7 +25,8 @@ class StickerRenderer:
         self.max_prompt_tags = max(0, int(max_prompt_tags))
         # 标签展示冷却：记录每个标签最近一次出现时间，以及最近窗口内的标签
         self._tag_last_shown_at: dict[str, float] = {}
-        self._recent_tag_window: deque[str] = deque(maxlen=20)
+        # 窗口大小至少覆盖 max_prompt_tags 的两倍，避免单轮展示过多导致冷却记录被挤出
+        self._recent_tag_window: deque[str] = deque(maxlen=max(100, self.max_prompt_tags * 2))
 
 
     async def build_sticker_list(self) -> str:
@@ -269,6 +270,7 @@ class StickerRenderer:
                 -float(item[1].get("last_used_at") or 0.0),
                 -int(item[1].get("usage_count") or 0),
             ),
+            # 同分情况下：last_used_at 越旧越优先，usage_count 越低越优先，实现轮询
             reverse=True,
         )
         top_score = scored_assets[0][0]
