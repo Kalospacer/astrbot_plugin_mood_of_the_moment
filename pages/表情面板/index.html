@@ -16,6 +16,7 @@
       <div class="header-actions">
         <button id="refreshBtn" type="button" class="ghost">刷新</button>
         <button id="selectModeBtn" type="button" class="ghost">选择</button>
+        <button id="openSettingsBtn" type="button" class="ghost">设置</button>
         <button id="openImportBtn" type="button" class="primary">添加表情</button>
       </div>
     </header>
@@ -72,6 +73,26 @@
     </div>
     <div id="detailPanel"></div>
   </aside>
+
+  <section id="settingsModal" class="modal" hidden>
+    <button class="modal-backdrop" type="button" data-close-settings aria-label="关闭"></button>
+    <form id="settingsForm" class="modal-panel settings-panel">
+      <div class="modal-head">
+        <div>
+          <span class="eyebrow">Settings</span>
+          <h2>插件设置</h2>
+        </div>
+        <button id="closeSettingsBtn" type="button" class="ghost">关闭</button>
+      </div>
+      <div id="settingsBody" class="settings-body">
+        <div class="empty">加载中...</div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="ghost" data-close-settings>取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </section>
 
   <section id="importModal" class="modal" hidden>
     <button class="modal-backdrop" type="button" data-close-import aria-label="关闭"></button>

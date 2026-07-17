@@ -67,6 +67,8 @@ class MoodPageApi:
                 ["POST"],
                 "Mood sticker rebuild dHash index",
             ),
+            ("/config", self.get_config, ["GET"], "Mood sticker config"),
+            ("/config/update", self.update_config, ["POST"], "Mood sticker config update"),
         ]
         for path, handler, methods, desc in routes:
             register(f"{PAGE_API_PREFIX}{path}", handler, methods, desc)
@@ -387,6 +389,86 @@ class MoodPageApi:
             return self._error("重建 dHash 索引需要 confirm=true")
         indexed = await self.plugin.facade.dedup.rebuild_index()
         return self._ok({"indexed": indexed})
+
+    async def get_config(self) -> dict[str, Any]:
+        try:
+            config = dict(self.plugin.config)
+            providers = []
+            try:
+                provider_insts = self.plugin.context.get_all_providers()
+                for prov in provider_insts:
+                    prov_id = getattr(prov, "provider_id", "") or getattr(prov, "id", "")
+                    prov_name = getattr(prov, "provider_name", "") or getattr(prov, "name", "") or prov_id
+                    if prov_id:
+                        providers.append({"id": str(prov_id), "name": str(prov_name)})
+            except Exception as exc:
+                logger.warning(f"{PLUGIN_NAME}: 获取 provider 列表失败: {exc}")
+            return self._ok({"config": config, "providers": providers})
+        except Exception as exc:
+            logger.error(f"{PLUGIN_NAME}: WebUI 获取配置失败: {exc}", exc_info=True)
+            return self._error(str(exc))
+
+    async def update_config(self) -> dict[str, Any]:
+        payload = await request.get_json(silent=True) or {}
+        schema = {
+            "tag_provider_id": ("string", 160),
+            "review_system_prompt": ("string", 4096),
+            "max_stickers": ("int", 0, None),
+            "max_stickers_per_message": ("int", 0, 10),
+            "max_prompt_tags": ("int", 0, 100),
+            "enable_auto_steal": ("bool",),
+            "cleanup_interval_hours": ("int", 1, None),
+            "cleanup_count": ("int", 1, None),
+            "enable_auto_cleanup": ("bool",),
+            "min_stickers_to_keep": ("int", 0, None),
+            "steal_all_images": ("bool",),
+            "only_store_emojis": ("bool",),
+        }
+        updates: dict[str, Any] = {}
+        for key, rules in schema.items():
+            if key not in payload:
+                continue
+            value = payload[key]
+            kind = rules[0]
+            try:
+                if kind == "bool":
+                    if not isinstance(value, bool):
+                        return self._error(f"字段 {key} 必须是布尔值")
+                    updates[key] = value
+                elif kind == "int":
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        return self._error(f"字段 {key} 必须是整数")
+                    int_value = int(value)
+                    if len(rules) > 1 and rules[1] is not None and int_value < rules[1]:
+                        return self._error(f"字段 {key} 不能小于 {rules[1]}")
+                    if len(rules) > 2 and rules[2] is not None and int_value > rules[2]:
+                        return self._error(f"字段 {key} 不能大于 {rules[2]}")
+                    updates[key] = int_value
+                elif kind == "string":
+                    if not isinstance(value, str):
+                        return self._error(f"字段 {key} 必须是字符串")
+                    max_len = rules[1] if len(rules) > 1 else 4096
+                    if len(value) > max_len:
+                        return self._error(f"字段 {key} 长度不能超过 {max_len}")
+                    updates[key] = value
+            except (TypeError, ValueError) as exc:
+                return self._error(f"字段 {key} 格式错误: {exc}")
+        if not updates:
+            return self._error("没有需要更新的配置字段")
+        try:
+            config = self.plugin.config
+            for key, value in updates.items():
+                config[key] = value
+            saved = False
+            save = getattr(config, "save_config", None)
+            if callable(save):
+                save()
+                saved = True
+            self.plugin.facade.set_plugin_config(dict(config))
+            return self._ok({"config": dict(config), "saved": saved, "updated": updates})
+        except Exception as exc:
+            logger.error(f"{PLUGIN_NAME}: WebUI 更新配置失败: {exc}", exc_info=True)
+            return self._error(str(exc))
 
     async def _serialize_asset(
         self,

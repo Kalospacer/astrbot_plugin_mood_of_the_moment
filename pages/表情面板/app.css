@@ -633,6 +633,63 @@ body.is-select-mode .thumb {
   background: var(--danger);
 }
 
+/* Settings modal */
+.settings-panel {
+  max-width: 560px;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-body label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.settings-body .form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.settings-body .checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.settings-body .checkbox-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--ink);
+  cursor: pointer;
+}
+
+.settings-body .checkbox-row span {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.settings-body textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
+@media (max-width: 640px) {
+  .settings-body .form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* Utilities */
 .empty {
   grid-column: 1 / -1;
