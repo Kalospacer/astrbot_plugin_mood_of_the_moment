@@ -717,3 +717,127 @@ body.is-select-mode .thumb {
     width: 100%;
   }
 }
+
+/* ===== v2 格式化旧库面板 ===== */
+.format-panel {
+  max-width: 760px;
+  width: min(760px, 94vw);
+}
+
+.format-body {
+  padding: 8px 0 4px;
+  max-height: 72vh;
+  overflow-y: auto;
+}
+
+.format-intro p {
+  margin: 0 0 12px;
+  color: var(--ink-muted);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.format-note {
+  font-size: 13px;
+  color: var(--ink-muted);
+  margin: 8px 0;
+}
+
+.format-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+
+.format-progress {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-alt, #eceae4);
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+
+.format-progress-bar {
+  height: 100%;
+  background: var(--ink, #222);
+  transition: width 0.4s ease;
+}
+
+.format-table-wrap {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--line, #e3e0d8);
+  border-radius: var(--radius, 12px);
+  margin-bottom: 16px;
+}
+
+.format-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.format-table th,
+.format-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--line, #e3e0d8);
+  vertical-align: top;
+}
+
+.format-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface, #fff);
+  font-weight: 600;
+}
+
+.format-table .desc-cell {
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.badge.ok {
+  background: #e2f3e4;
+  color: #1e7a34;
+}
+
+.badge.fail {
+  background: #fbe4e4;
+  color: #b42318;
+}
+
+.ok-text { color: #1e7a34; }
+.fail-text { color: #b42318; }
+
+.format-warning {
+  color: #b42318;
+  font-size: 14px;
+  line-height: 1.7;
+  margin: 12px 0;
+  padding: 12px;
+  background: #fdf2f1;
+  border: 1px solid #f3c1bc;
+  border-radius: var(--radius, 12px);
+}
+
+.format-confirm .modal-actions {
+  justify-content: flex-end;
+}
+
+.format-badge {
+  color: #8a5a00;
+  font-size: 13px;
+}

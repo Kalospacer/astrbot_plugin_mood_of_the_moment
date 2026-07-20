@@ -11,7 +11,6 @@ const state = {
   filters: {
     q: "",
     tag: "",
-    group: "",
     status: "",
     sortBy: "created_at",
     sortOrder: "desc",
@@ -22,6 +21,8 @@ const state = {
   imageCache: new Map(),
   config: null,
   providers: [],
+  formatJob: null,
+  formatTimer: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -63,11 +64,11 @@ async function customConfirm(message) {
       </div>
     `;
     document.body.appendChild(overlay);
-    
+
     const cleanUp = () => {
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
     };
-    
+
     overlay.querySelector("#customConfirmCancel").onclick = () => {
       cleanUp();
       resolve(false);
@@ -154,28 +155,26 @@ async function loadAll() {
 
 async function loadOverview() {
   state.overview = await fetchJson("/overview");
+  state.formatJob = state.overview?.format_job || null;
 }
 
 async function loadStickers() {
   const params = new URLSearchParams();
-  const { q, tag, group, status, sortBy, sortOrder, page, pageSize } = state.filters;
+  const { q, tag, status, sortBy, sortOrder, page, pageSize } = state.filters;
   if (q) params.set("q", q);
   if (tag) params.set("tag", tag);
-  if (group) params.set("group", group);
   if (status) params.set("status", status);
   params.set("sort_by", sortBy);
   params.set("sort_order", sortOrder);
   params.set("page", String(page));
   params.set("page_size", String(pageSize));
-  
+
   const result = await fetchJson(`/stickers?${params.toString()}`);
   state.stickers = result.items || [];
   state.filters.total = Number(result.total || 0);
   state.filters.page = Number(result.page || page);
   state.filters.sortBy = result.sort_by || sortBy;
   state.filters.sortOrder = result.sort_order || sortOrder;
-  
-  // Selected IDs are preserved across pages to support multi-page bulk operations.
 }
 
 function renderAll() {
@@ -191,9 +190,12 @@ function renderStats() {
   const statsEl = $("#stats");
   if (!statsEl) return;
   const overview = state.overview || {};
+  const formatJob = state.formatJob || {};
+  const formatActive = ["preparing", "ready"].includes(formatJob.status);
   statsEl.innerHTML = `
     <span><b>${state.filters.total}</b> 张贴纸</span>
     ${overview.missing ? `<span><b>${overview.missing}</b> 个文件丢失</span>` : ""}
+    ${formatActive ? `<span class="format-badge">旧库格式化进行中：${escapeHtml(formatJob.status)}（${formatJob.processed || 0}/${formatJob.total || 0}）</span>` : ""}
   `;
 }
 
@@ -202,7 +204,7 @@ function renderTags() {
   if (!rail) return;
   const overview = state.overview || {};
   const tags = overview.tags || [];
-  
+
   const clearBtn = $("#clearFilterBtn");
   if (clearBtn) {
     clearBtn.className = `tag-chip ${!state.filters.tag ? "is-active" : ""}`;
@@ -218,23 +220,23 @@ function renderTags() {
 function renderStickerWall() {
   const wall = $("#stickerWall");
   if (!wall) return;
-  
+
   document.body.classList.toggle("is-select-mode", state.isSelectMode);
-  
+
   if (!state.stickers.length) {
     wall.innerHTML = `<div class="empty">没有找到贴纸</div>`;
     return;
   }
-  
+
   wall.innerHTML = state.stickers.map((asset) => `
     <article class="sticker ${state.selectedIds.has(asset.asset_id) ? "is-selected" : ""} ${asset.exists ? "" : "missing"}" data-asset-id="${escapeHtml(asset.asset_id)}">
       <input class="sticker-select" type="checkbox" data-select-asset="${escapeHtml(asset.asset_id)}" ${state.selectedIds.has(asset.asset_id) ? "checked" : ""} aria-label="选择" />
       <div class="thumb" data-open-asset="${escapeHtml(asset.asset_id)}">
-        ${asset.exists ? `<img alt="${escapeHtml(asset.original_name)}" data-image-asset="${escapeHtml(asset.asset_id)}" />` : `<span class="missing-text">文件缺失</span>`}
+        ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-image-asset="${escapeHtml(asset.asset_id)}" />` : `<span class="missing-text">文件缺失</span>`}
       </div>
       <div class="sticker-meta">
-        <b title="${escapeHtml(asset.original_name)}">${escapeHtml(asset.original_name)}</b>
-        <small>${escapeHtml(asset.group_name)} · ${escapeHtml(asset.usage_count)} 次</small>
+        <b title="${escapeHtml(asset.meme_def)}">:${escapeHtml(asset.meme_def)}:</b>
+        <small>${escapeHtml((asset.tags || []).join(" · "))} · ${escapeHtml(asset.usage_count)} 次</small>
       </div>
     </article>
   `).join("");
@@ -286,13 +288,14 @@ function renderDetailDrawer() {
   }
   panel.innerHTML = `
     <div class="detail-image">
-      ${asset.exists ? `<img alt="${escapeHtml(asset.original_name)}" data-image-asset="${escapeHtml(asset.asset_id)}" />` : `<span class="missing-text">文件缺失</span>`}
+      ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-image-asset="${escapeHtml(asset.asset_id)}" />` : `<span class="missing-text">文件缺失</span>`}
     </div>
     <form id="detailForm" class="detail-form">
-      <label><span>分组</span><input name="group_name" value="${escapeHtml(asset.group_name)}" /></label>
-      <label><span>标签 (逗号分隔)</span><input name="labels" value="${escapeHtml((asset.labels || []).join(", "))}" /></label>
-      <label><span>描述</span><textarea name="description">${escapeHtml(asset.description || "")}</textarea></label>
+      <label><span>meme_def（唯一名称）</span><input name="meme_def" value="${escapeHtml(asset.meme_def)}" required /></label>
+      <label><span>tags（逗号分隔）</span><input name="tags" value="${escapeHtml((asset.tags || []).join(", "))}" required /></label>
+      <label><span>描述</span><textarea name="description" required>${escapeHtml(asset.description || "")}</textarea></label>
       <label><span>来源</span><input name="source" value="${escapeHtml(asset.source || "")}" /></label>
+      <label><span>发送标记</span><code>:${escapeHtml(asset.meme_def)}:</code></label>
       <label><span>asset_id</span><code>${escapeHtml(asset.asset_id)}</code></label>
       <label><span>文件</span><code>${escapeHtml(asset.storage_key || asset.file_path || "")}</code></label>
       <div class="detail-actions">
@@ -359,13 +362,13 @@ function renderSettingsForm() {
   const providers = state.providers || [];
   const providerOptions = [
     `<option value="">默认（留空）</option>`,
-    ...providers.map(p => `<option value="${escapeHtml(p.id)}" ${c.tag_provider_id === p.id ? "selected" : ""}>${escapeHtml(p.name || p.id)}</option>`)
+    ...providers.map(p => `<option value="${escapeHtml(p.id)}" ${c.meme_review_provider_id === p.id ? "selected" : ""}>${escapeHtml(p.name || p.id)}</option>`)
   ].join("");
 
   body.innerHTML = `
     <label>
       <span>审查 LLM Provider</span>
-      <select name="tag_provider_id">${providerOptions}</select>
+      <select name="meme_review_provider_id">${providerOptions}</select>
     </label>
     <label>
       <span>审查 System Prompt</span>
@@ -383,19 +386,25 @@ function renderSettingsForm() {
     </div>
     <div class="form-grid">
       <label>
-        <span>提示标签数量上限</span>
-        <input name="max_prompt_tags" type="number" min="0" max="100" value="${escapeHtml(c.max_prompt_tags ?? 30)}" />
+        <span>注入 meme_def 数量上限</span>
+        <input name="max_prompt_meme_defs" type="number" min="0" max="200" value="${escapeHtml(c.max_prompt_meme_defs ?? 30)}" />
       </label>
       <label>
-        <span>清理间隔（小时）</span>
-        <input name="cleanup_interval_hours" type="number" min="1" value="${escapeHtml(c.cleanup_interval_hours ?? 1)}" />
+        <span>注入 tag 数量上限</span>
+        <input name="max_prompt_tags" type="number" min="0" max="200" value="${escapeHtml(c.max_prompt_tags ?? 30)}" />
       </label>
     </div>
     <div class="form-grid">
       <label>
+        <span>清理间隔（小时）</span>
+        <input name="cleanup_interval_hours" type="number" min="1" value="${escapeHtml(c.cleanup_interval_hours ?? 1)}" />
+      </label>
+      <label>
         <span>每次清理数量</span>
         <input name="cleanup_count" type="number" min="1" value="${escapeHtml(c.cleanup_count ?? 5)}" />
       </label>
+    </div>
+    <div class="form-grid">
       <label>
         <span>最小保留数量</span>
         <input name="min_stickers_to_keep" type="number" min="0" value="${escapeHtml(c.min_stickers_to_keep ?? 0)}" />
@@ -441,10 +450,11 @@ function collectSettingsPayload() {
   if (!form) return null;
   const fd = new FormData(form);
   return {
-    tag_provider_id: String(fd.get("tag_provider_id") || ""),
+    meme_review_provider_id: String(fd.get("meme_review_provider_id") || ""),
     review_system_prompt: String(fd.get("review_system_prompt") || ""),
     max_stickers: parseInt(fd.get("max_stickers"), 10) || 0,
     max_stickers_per_message: parseInt(fd.get("max_stickers_per_message"), 10) || 0,
+    max_prompt_meme_defs: parseInt(fd.get("max_prompt_meme_defs"), 10) || 0,
     max_prompt_tags: parseInt(fd.get("max_prompt_tags"), 10) || 0,
     cleanup_interval_hours: parseInt(fd.get("cleanup_interval_hours"), 10) || 1,
     cleanup_count: parseInt(fd.get("cleanup_count"), 10) || 1,
@@ -456,17 +466,190 @@ function collectSettingsPayload() {
   };
 }
 
-// Global click handler
+// ---------- 格式化旧库 ----------
+
+function stopFormatPolling() {
+  if (state.formatTimer) {
+    clearInterval(state.formatTimer);
+    state.formatTimer = null;
+  }
+}
+
+async function refreshFormatStatus(render = true) {
+  try {
+    state.formatJob = await fetchJson("/maintenance/format_old_library/status");
+  } catch (err) {
+    state.formatJob = { status: "error", error: err.message };
+  }
+  if (render) renderFormatBody();
+}
+
+async function openFormatModal() {
+  const modal = $("#formatModal");
+  if (!modal) return;
+  modal.hidden = false;
+  $("#formatBody").innerHTML = `<div class="empty">加载中...</div>`;
+  await refreshFormatStatus();
+}
+
+function closeFormatModal() {
+  stopFormatPolling();
+  $("#formatModal").hidden = true;
+}
+
+function formatItemStatusBadge(item) {
+  if (item.status === "success") return `<span class="badge ok">成功</span>`;
+  return `<span class="badge fail">失败</span>`;
+}
+
+function renderFormatBody() {
+  const body = $("#formatBody");
+  if (!body) return;
+  const job = state.formatJob || { status: "idle" };
+  const status = job.status || "idle";
+
+  if (status === "idle" || status === "committed" || status === "cancelled") {
+    const note = status === "committed"
+      ? `<p class="format-note ok-text">上一次格式化已提交完成。</p>`
+      : status === "cancelled"
+        ? `<p class="format-note">上一次格式化已取消。</p>`
+        : "";
+    body.innerHTML = `
+      <div class="format-intro">
+        <p>此工具使用视觉模型重新识别旧库（stickers.sqlite3）中的所有图片，为每张图片生成新的 <b>meme_def</b>、描述和 tags，并迁移到 v2 新库。</p>
+        <p>运行前提：当前新库必须为空。迁移期间将暂停自动采集、手动导入和自动清理。</p>
+        ${note}
+        <button id="startFormatBtn" type="button" class="primary">开始格式化旧库</button>
+      </div>
+    `;
+    stopFormatPolling();
+    return;
+  }
+
+  if (status === "failed" || status === "error") {
+    body.innerHTML = `
+      <div class="format-intro">
+        <p class="format-note fail-text">格式化分析失败：${escapeHtml(job.error || "未知错误")}</p>
+        <button id="cancelFormatBtn" type="button" class="ghost" data-job-id="${escapeHtml(job.job_id || "")}">清理任务</button>
+      </div>
+    `;
+    stopFormatPolling();
+    return;
+  }
+
+  const processed = job.processed || 0;
+  const total = job.total || 0;
+  const succeeded = job.succeeded || 0;
+  const failed = job.failed || 0;
+  const items = job.items || [];
+  const progressPct = total ? Math.round((processed / total) * 100) : 0;
+
+  const rows = items.map((item) => `
+    <tr>
+      <td>${formatItemStatusBadge(item)}</td>
+      <td><code>${escapeHtml(item.old_storage_key || "")}</code></td>
+      <td>${item.meme_def ? `<b>:${escapeHtml(item.meme_def)}:</b>` : "-"}</td>
+      <td>${escapeHtml((item.tags || []).join(", ") || "-")}</td>
+      <td class="desc-cell" title="${escapeHtml(item.description || item.reason || "")}">${escapeHtml(item.description || item.reason || "")}</td>
+    </tr>
+  `).join("");
+
+  const actionBar = status === "ready"
+    ? `
+      <div class="format-confirm">
+        <p class="format-warning">⚠️ 提交后：仅成功项进入新库；<b>${failed} 个失败项将被永久删除</b>（随旧库一起清除），且不可恢复。</p>
+        <div class="modal-actions" style="padding:0;border:none;">
+          <button id="cancelFormatBtn" type="button" class="ghost" data-job-id="${escapeHtml(job.job_id)}">取消任务</button>
+          <button id="commitFormatBtn" type="button" class="primary danger" data-job-id="${escapeHtml(job.job_id)}">确认提交（删除失败项）</button>
+        </div>
+      </div>
+    `
+    : `<p class="format-note">正在逐张调用视觉模型识图，请稍候……</p>`;
+
+  body.innerHTML = `
+    <div class="format-summary">
+      <span>旧资产总数 <b>${total}</b></span>
+      <span>已处理 <b>${processed}</b>（${progressPct}%）</span>
+      <span class="ok-text">识图成功 <b>${succeeded}</b></span>
+      <span class="fail-text">识图失败 <b>${failed}</b></span>
+    </div>
+    <div class="format-progress"><div class="format-progress-bar" style="width:${progressPct}%"></div></div>
+    <div class="format-table-wrap">
+      <table class="format-table">
+        <thead><tr><th>结果</th><th>旧文件</th><th>新 meme_def</th><th>新 tags</th><th>新描述 / 失败原因</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="5" class="empty">暂无条目</td></tr>`}</tbody>
+      </table>
+    </div>
+    ${actionBar}
+  `;
+
+  if (status === "preparing") {
+    if (!state.formatTimer) {
+      state.formatTimer = setInterval(() => refreshFormatStatus(), 1500);
+    }
+  } else {
+    stopFormatPolling();
+  }
+}
+
+async function startFormatJob() {
+  try {
+    state.formatJob = await fetchJson("/maintenance/format_old_library/prepare", { method: "POST", body: {} });
+    renderFormatBody();
+  } catch (err) {
+    showToast(err.message || "无法启动格式化", "error");
+    await refreshFormatStatus();
+  }
+}
+
+async function commitFormatJob(jobId) {
+  const job = state.formatJob || {};
+  const failed = job.failed || 0;
+  const ok = await customConfirm(`确认提交格式化结果？成功项进入新库，${failed} 个失败项将随旧库被永久删除！`);
+  if (!ok) return;
+  const btn = $("#commitFormatBtn");
+  if (btn) btn.disabled = true;
+  try {
+    state.formatJob = await fetchJson("/maintenance/format_old_library/commit", {
+      method: "POST",
+      body: { job_id: jobId, confirm: true, discard_failed: true },
+    });
+    state.imageCache.clear();
+    showToast("格式化已提交，旧库已清除");
+    closeFormatModal();
+    await reloadAfterMutation("");
+  } catch (err) {
+    showToast(err.message || "提交失败", "error");
+    await refreshFormatStatus();
+  }
+}
+
+async function cancelFormatJob(jobId) {
+  const ok = await customConfirm("取消并清理本次格式化任务？staging 临时文件将被删除。");
+  if (!ok) return;
+  try {
+    state.formatJob = await fetchJson("/maintenance/format_old_library/cancel", {
+      method: "POST",
+      body: { job_id: jobId },
+    });
+    showToast("格式化任务已取消");
+    await refreshFormatStatus();
+  } catch (err) {
+    showToast(err.message || "取消失败", "error");
+    await refreshFormatStatus();
+  }
+}
+
+// ---------- 全局事件 ----------
+
 document.addEventListener("click", async (event) => {
   const target = event.target;
 
-  // Drawer close
   if (target.id === "closeDetailBtn") {
     $("#detailDrawer").setAttribute("aria-hidden", "true");
     return;
   }
 
-  // Modal open/close
   if (target.id === "openImportBtn") {
     $("#importModal").hidden = false;
     return;
@@ -476,7 +659,6 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  // Settings modal
   if (target.id === "openSettingsBtn") {
     await openSettings();
     return;
@@ -486,7 +668,29 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  // Select mode toggle
+  if (target.id === "openFormatBtn") {
+    await openFormatModal();
+    return;
+  }
+  if (target.id === "closeFormatBtn" || target.matches("[data-close-format]")) {
+    closeFormatModal();
+    await loadOverview();
+    renderStats();
+    return;
+  }
+  if (target.id === "startFormatBtn") {
+    await startFormatJob();
+    return;
+  }
+  if (target.id === "commitFormatBtn") {
+    await commitFormatJob(target.dataset.jobId || "");
+    return;
+  }
+  if (target.id === "cancelFormatBtn") {
+    await cancelFormatJob(target.dataset.jobId || "");
+    return;
+  }
+
   if (target.id === "selectModeBtn") {
     toggleSelectMode(true);
     return;
@@ -496,12 +700,10 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  // Click on a sticker
   const openTarget = target.closest?.("[data-open-asset]");
   if (openTarget) {
     const assetId = openTarget.dataset.openAsset;
     if (state.isSelectMode) {
-      // Toggle selection
       if (state.selectedIds.has(assetId)) {
         state.selectedIds.delete(assetId);
       } else {
@@ -510,13 +712,11 @@ document.addEventListener("click", async (event) => {
       renderStickerWall();
       renderSelectionBar();
     } else {
-      // Open drawer
       await selectAssetForEdit(assetId);
     }
     return;
   }
 
-  // Tags filter
   const tagBtn = target.closest?.("[data-filter-tag]");
   if (tagBtn) {
     const value = tagBtn.dataset.filterTag;
@@ -535,7 +735,6 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  // Other actions
   if (target.id === "refreshBtn") {
     await reloadAfterMutation("已刷新");
     return;
@@ -605,20 +804,18 @@ document.addEventListener("click", async (event) => {
   }
 });
 
-// Checkbox selection
 document.addEventListener("change", async (event) => {
   const target = event.target;
   if (target.matches("[data-select-asset]")) {
     if (target.checked) state.selectedIds.add(target.dataset.selectAsset);
     else state.selectedIds.delete(target.dataset.selectAsset);
     renderSelectionBar();
-    
-    // Update the parent article class
+
     const article = target.closest("article.sticker");
     if (article) article.classList.toggle("is-selected", target.checked);
     return;
   }
-  
+
   if (target.id === "statusFilter") {
     state.filters.status = target.value;
     state.filters.page = 1;
@@ -641,7 +838,6 @@ document.addEventListener("change", async (event) => {
   }
 });
 
-// Search input
 $("#searchInput")?.addEventListener("input", debounce(async (event) => {
   state.filters.q = event.target.value.trim();
   state.filters.page = 1;
@@ -649,7 +845,6 @@ $("#searchInput")?.addEventListener("input", debounce(async (event) => {
   renderAll();
 }, 220));
 
-// File input display
 const fileInput = $("#fileInput");
 if (fileInput) {
   fileInput.addEventListener("change", (e) => {
@@ -662,7 +857,6 @@ if (fileInput) {
   });
 }
 
-// Read file as base64
 function readFileAsDataURL(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -672,48 +866,41 @@ function readFileAsDataURL(file) {
   });
 }
 
-// Import form submit
 $("#importForm")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   const button = form.querySelector("button[type='submit']");
   button.disabled = true;
-  
+
   try {
     const file = form.elements.file.files[0];
+    const memeDef = formValue(form, "meme_def");
+    const tags = formValue(form, "tags");
+    const description = formValue(form, "description");
     let result;
-    
+
     if (file) {
-      // POST to /sticker/upload
       const data_url = await readFileAsDataURL(file);
       result = await fetchJson("/sticker/upload", {
         method: "POST",
-        body: {
-          data_url,
-          filename: file.name,
-          group_name: formValue(form, "group_name") || "unsorted",
-          labels: formValue(form, "labels"),
-          description: formValue(form, "description")
-        },
+        body: { data_url, meme_def: memeDef, tags, description },
       });
     } else {
-      // POST to /sticker/import
       result = await fetchJson("/sticker/import", {
         method: "POST",
         body: {
           image_source: formValue(form, "image_source"),
-          group_name: formValue(form, "group_name") || "unsorted",
-          labels: formValue(form, "labels"),
-          description: formValue(form, "description")
+          meme_def: memeDef,
+          tags,
+          description,
         },
       });
     }
-    
+
     form.reset();
-    form.elements.group_name.value = "unsorted";
     $("#fileName").textContent = "也可以在下面粘贴 http/https 图片地址或服务器本地路径";
     $("#importModal").hidden = true;
-    
+
     await reloadAfterMutation("已添加表情");
     if (result.asset) {
       await selectAssetForEdit(result.asset.asset_id);
@@ -725,7 +912,6 @@ $("#importForm")?.addEventListener("submit", async (event) => {
   }
 });
 
-// Settings form submit
 document.addEventListener("submit", async (event) => {
   const form = event.target;
   if (!(form instanceof HTMLFormElement) || form.id !== "settingsForm") return;
@@ -750,7 +936,6 @@ document.addEventListener("submit", async (event) => {
   }
 });
 
-// Detail form submit
 document.addEventListener("submit", async (event) => {
   const form = event.target;
   if (!(form instanceof HTMLFormElement) || form.id !== "detailForm") return;
@@ -763,8 +948,8 @@ document.addEventListener("submit", async (event) => {
       method: "POST",
       body: {
         asset_id: state.selectedAssetId,
-        group_name: formValue(form, "group_name"),
-        labels: formValue(form, "labels"),
+        meme_def: formValue(form, "meme_def"),
+        tags: formValue(form, "tags"),
         description: formValue(form, "description"),
         source: formValue(form, "source"),
       },
@@ -772,6 +957,8 @@ document.addEventListener("submit", async (event) => {
     state.selectedAsset = result;
     state.imageCache.delete(state.selectedAssetId);
     await reloadAfterMutation("修改已保存");
+  } catch (err) {
+    showToast(err.message || "保存失败", "error");
   } finally {
     if (button) button.disabled = false;
   }
@@ -785,7 +972,6 @@ function debounce(fn, delay) {
   };
 }
 
-// Initial load
 loadAll().catch((error) => {
   showToast(error.message || "加载失败", "error");
   const wall = $("#stickerWall");

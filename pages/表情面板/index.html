@@ -4,18 +4,19 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>此刻的心情</title>
-  <link rel="stylesheet" href="./app.css?v=20260706-library1" />
+  <link rel="stylesheet" href="./app.css?v=20260721-v2" />
 </head>
 <body>
   <main class="shell">
     <header class="app-header">
       <div class="brand">
-        <span class="eyebrow">Sticker library</span>
+        <span class="eyebrow">Sticker library v2</span>
         <h1>此刻的心情</h1>
       </div>
       <div class="header-actions">
         <button id="refreshBtn" type="button" class="ghost">刷新</button>
         <button id="selectModeBtn" type="button" class="ghost">选择</button>
+        <button id="openFormatBtn" type="button" class="ghost">格式化旧库</button>
         <button id="openSettingsBtn" type="button" class="ghost">设置</button>
         <button id="openImportBtn" type="button" class="primary">添加表情</button>
       </div>
@@ -25,7 +26,7 @@
 
     <section class="filter-panel">
       <div class="search-row">
-        <input id="searchInput" type="search" placeholder="搜索标签、文件名、来源、asset_id" />
+        <input id="searchInput" type="search" placeholder="搜索 meme_def、tags、描述、来源、asset_id" />
         <select id="statusFilter" aria-label="状态筛选">
           <option value="">全部状态</option>
           <option value="missing">缺失文件</option>
@@ -34,7 +35,7 @@
           <option value="created_at">添加时间</option>
           <option value="usage_count">使用次数</option>
           <option value="last_used_at">最近使用</option>
-          <option value="original_name">文件名</option>
+          <option value="meme_def">meme_def</option>
         </select>
         <select id="sortOrderSelect" aria-label="排序方向">
           <option value="desc">降序</option>
@@ -113,19 +114,17 @@
         <span>图片地址或本地路径</span>
         <input name="image_source" placeholder="https://... 或 C:\path\image.png" />
       </label>
-      <div class="form-grid">
-        <label>
-          <span>标签</span>
-          <input name="labels" placeholder="开心, 摸鱼, 二次元" />
-        </label>
-        <label>
-          <span>分组</span>
-          <input name="group_name" placeholder="默认 unsorted" value="unsorted" />
-        </label>
-      </div>
       <label>
-        <span>描述</span>
-        <textarea name="description" placeholder="可选，写给以后搜索用"></textarea>
+        <span>meme_def（唯一名称，建议 角色_动作）</span>
+        <input name="meme_def" placeholder="真冬_低头" required />
+      </label>
+      <label>
+        <span>tags（逗号分隔，至少一个分组标签）</span>
+        <input name="tags" placeholder="二次元, 疲惫" required />
+      </label>
+      <label>
+        <span>描述（画面、情绪、适用场景）</span>
+        <textarea name="description" required placeholder="角色低头，表情疲惫，适合表达无力和不想继续解释。"></textarea>
       </label>
       <div class="modal-actions">
         <button type="button" class="ghost" data-close-import>取消</button>
@@ -134,7 +133,23 @@
     </form>
   </section>
 
+  <section id="formatModal" class="modal" hidden>
+    <button class="modal-backdrop" type="button" data-close-format aria-label="关闭"></button>
+    <div class="modal-panel format-panel">
+      <div class="modal-head">
+        <div>
+          <span class="eyebrow">Format legacy library</span>
+          <h2>格式化旧库</h2>
+        </div>
+        <button id="closeFormatBtn" type="button" class="ghost">关闭</button>
+      </div>
+      <div id="formatBody" class="format-body">
+        <div class="empty">加载中...</div>
+      </div>
+    </div>
+  </section>
+
   <div id="toast" class="toast" aria-live="polite"></div>
-  <script src="./app.js?v=20260706-library1"></script>
+  <script src="./app.js?v=20260721-v2"></script>
 </body>
 </html>

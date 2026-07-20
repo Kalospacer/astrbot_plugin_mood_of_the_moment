@@ -6,33 +6,49 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 
-from .constants import DEFAULT_CATEGORY
 
-
-def normalize_category_name(category: str | None) -> str:
-    text = (category or "").strip().lower()
-    if not text:
-        return DEFAULT_CATEGORY
+def normalize_meme_def(value: str | None) -> str:
+    text = Path(str(value or "").strip()).stem
     text = re.sub(r"[\s\-]+", "_", text)
-    text = re.sub(r"[^a-z0-9_\u4e00-\u9fff]", "", text)
+    text = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff]", "", text)
     text = re.sub(r"_+", "_", text).strip("_")
-    return text or DEFAULT_CATEGORY
+    return text[:120]
 
 
 def normalize_tag_display_name(tag: str | None) -> str:
     text = (tag or "").strip()
-    return text or DEFAULT_CATEGORY
+    text = re.sub(r"[\r\n:：]+", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text[:80]
+
+
+def normalize_tags(values: object, *, max_items: int = 12) -> tuple[str, ...]:
+    if isinstance(values, str):
+        raw_items = values.replace("，", ",").replace("、", ",").split(",")
+    elif isinstance(values, (list, tuple, set)):
+        raw_items = list(values)
+    else:
+        raw_items = []
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        tag = normalize_tag_display_name(str(raw or ""))
+        identity = tag.casefold()
+        if not tag or identity in seen:
+            continue
+        seen.add(identity)
+        result.append(tag)
+        if len(result) >= max_items:
+            break
+    return tuple(result)
 
 
 def safe_filename(name: str | None, suffix: str) -> str:
-    base = (name or "").strip()
-    if base:
-        base = Path(base).name
-        base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base)
-        stem = Path(base).stem.strip() or f"meme_{int(time.time())}"
-        ext = Path(base).suffix or suffix
-        return f"{stem}{ext.lower()}"
-    return f"meme_{int(time.time())}{suffix.lower()}"
+    base = Path(str(name or "").strip()).name
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base)
+    stem = Path(base).stem.strip() or f"meme_{int(time.time())}"
+    ext = Path(base).suffix or suffix
+    return f"{stem}{ext.lower()}"
 
 
 def resolve_user_path(raw_path: str) -> Path:
@@ -43,10 +59,7 @@ def get_allowed_image_roots(
     data_dir: Path,
     extra_roots: Iterable[Path] | None = None,
 ) -> tuple[Path, ...]:
-    roots = {
-        data_dir.resolve(),
-        Path.cwd().resolve(),
-    }
+    roots = {data_dir.resolve(), Path.cwd().resolve()}
     if extra_roots:
         roots.update(path.resolve() for path in extra_roots)
     return tuple(sorted(roots))

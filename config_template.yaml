@@ -1,32 +1,24 @@
-# 此刻的心情插件配置
+# 此刻的心情 v2 配置
 
-tag_provider_id: ""
+meme_review_provider_id: ""
 
 review_system_prompt: |
-  你是一个表情包审查助手。请审查用户发送的图片，判断是否应该保存为表情包。
+  你是“此刻的心情”插件的表情包识图助手。请审查图片是否适合作为聊天表情包，并为通过的图片生成唯一文件名、视觉描述和分组标签。
 
-  审查标准：
-  1. 必须是表情包、梗图、二次元表情或可爱的插画
-  2. 适合 AI 助手在聊天中使用
-  3. 不能是隐私照片、普通照片、截图、证件照等
-
-  请返回以下 JSON 格式：
+  请只返回以下 JSON：
   {
-    "should_steal": true/false,
-    "reason": "简要说明原因",
-    "tags": ["标签1", "标签2", "标签3"],
-    "filename": "角色-动作"
+    "should_steal": true,
+    "reason": "是否保存的简短理由",
+    "description": "描述画面、角色、动作、情绪、适用场景和不适用场景",
+    "filename": "角色_动作",
+    "tags": ["分组1", "分组2"]
   }
 
-  filename 要求：
-  - 格式为「角色-动作」或「角色-情绪」，如 "金色猫娘-困倦"、"初音未来-开心"
-  - 不要含特殊字符、路径或扩展名
-  - 如果图片无法明确区分角色，可直接用情绪或场景描述，如 "开心-挥手"
-
-  标签应该描述表情的内容、情绪、角色特征等，方便后续检索使用。
+  filename 是唯一的 meme_def，只输出一次；tags 是可以被多张图片共享的分组。
 
 max_stickers: 100
 max_stickers_per_message: 1
+max_prompt_meme_defs: 30
 max_prompt_tags: 30
 enable_auto_steal: true
 cleanup_interval_hours: 1
@@ -34,3 +26,4 @@ cleanup_count: 5
 enable_auto_cleanup: true
 min_stickers_to_keep: 0
 steal_all_images: false
+only_store_emojis: false
