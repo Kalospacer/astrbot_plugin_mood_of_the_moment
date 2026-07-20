@@ -752,8 +752,37 @@ async function cancelFormatJob(jobId) {
 
 // ---------- 全局事件 ----------
 
+// 文档视图切换
+let docsMode = false;
+function toggleDocsView(on) {
+  docsMode = on;
+  const main = document.querySelector(".shell");
+  ["#stats", ".filter-panel", "#mainView"].forEach((sel) => {
+    const el = document.querySelector(sel);
+    if (el) el.hidden = on;
+  });
+  const docs = document.querySelector("#docsView");
+  if (docs) docs.hidden = !on;
+  const btn = document.querySelector("#docsViewBtn");
+  if (btn) {
+    btn.textContent = on ? "返回" : "文档";
+    btn.classList.toggle("primary", on);
+    btn.classList.toggle("ghost", !on);
+  }
+  // 文档模式下隐藏其他操作按钮
+  ["#refreshBtn", "#selectModeBtn", "#openFormatBtn", "#openSettingsBtn", "#openImportBtn"].forEach((sel) => {
+    const el = document.querySelector(sel);
+    if (el) el.hidden = on;
+  });
+}
+
 document.addEventListener("click", async (event) => {
   const target = event.target;
+
+  if (target.id === "docsViewBtn") {
+    toggleDocsView(!docsMode);
+    return;
+  }
 
   if (target.id === "closeDetailBtn") {
     $("#detailDrawer").setAttribute("aria-hidden", "true");
