@@ -936,5 +936,28 @@ class TestThumbnail(TempDirCase):
         self.assertFalse(f.exists())
 
 
+class TestFacadeThumbnailPrune(TempDirCase):
+    """回归：启动清理孤兒缩略图时，数据库异常不得误删全部缩略图。"""
+
+    def test_db_error_does_not_delete_thumbnails(self):
+        paths = PluginPaths(
+            plugin_dir=self.tmp,
+            data_dir=self.tmp / "data",
+            stickers_dir=self.tmp / "data" / "meme_defs",
+            metadata_db=self.tmp / "data" / "meme_defs.sqlite3",
+        )
+        facade = facade_mod.PluginFacade(paths=paths, context=None, plugin_config={})
+        # 建一个损坏的 db 文件 + 一个缩略图
+        paths.data_dir.mkdir(parents=True, exist_ok=True)
+        paths.metadata_db.write_bytes(b"not a sqlite db")
+        thumb_dir = paths.data_dir / ".thumbnails"
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        f = thumb_dir / "some.webp"
+        f.write_bytes(b"x")
+        # 调用清理：db 损坏应返回 0 且不删除任何缩略图
+        run(facade._prune_orphan_thumbnails())
+        self.assertTrue(f.exists(), "数据库异常时不应删除缩略图")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -124,7 +124,8 @@ class PluginFacade:
                             for row in conn.execute("SELECT asset_id FROM sticker_assets")
                         }
                 except Exception:
-                    valid_ids = set()
+                    # 数据库读失败时不做任何清理，避免误删全部缩略图。
+                    return 0
             for path in thumb_dir.glob("*.webp"):
                 if path.stem not in valid_ids:
                     try:

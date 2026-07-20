@@ -491,7 +491,7 @@ class LegacyFormatService:
         used_defs.add(meme_def.casefold())
         used_tags.update(tag.casefold() for tag in tags)
         staged_name = safe_filename(meme_def, source_path.suffix.lower() or ".png")
-        shutil.copy2(source_path, assets_dir / staged_name)
+        await asyncio.to_thread(shutil.copy2, source_path, assets_dir / staged_name)
         return {
             **base,
             "status": "success",
