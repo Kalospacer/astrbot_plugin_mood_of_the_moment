@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import time
 from pathlib import Path
@@ -10,7 +9,7 @@ from urllib.parse import urlparse
 from astrbot.api import logger
 from PIL import Image, UnidentifiedImageError
 
-from .constants import DEFAULT_CATEGORY, SUPPORTED_IMAGE_SUFFIXES
+from .constants import SUPPORTED_IMAGE_SUFFIXES
 from .dedup import DHashDedupService
 from .downloader import RemoteImageDownloader
 from .models import (
@@ -19,17 +18,16 @@ from .models import (
     IngestResult,
     PluginPaths,
     StickerAssetDraft,
-    StickerGroup,
+    StickerUsageEvent,
 )
-
 from .render import StickerRenderer
 from .review import ReviewService
 from .storage import StickerStorage
 from .utils import (
     get_allowed_image_roots,
     is_path_within_roots,
-    normalize_category_name,
-    normalize_tag_display_name,
+    normalize_meme_def,
+    normalize_tags,
     resolve_user_path,
 )
 
@@ -49,6 +47,9 @@ class PluginFacade:
                 self.plugin_config.get("max_stickers_per_message", 1) or 1
             ),
             max_prompt_tags=int(self.plugin_config.get("max_prompt_tags", 30) or 30),
+            max_prompt_meme_defs=int(
+                self.plugin_config.get("max_prompt_meme_defs", 30) or 30
+            ),
         )
         self.allowed_image_roots = get_allowed_image_roots(
             data_dir=self.paths.data_dir,
@@ -62,6 +63,7 @@ class PluginFacade:
         self._inflight_lock = asyncio.Lock()
         self._ingest_lock = asyncio.Lock()
         self._cleanup_last_run = 0.0
+        self.format_busy = False
 
     def set_context(self, context) -> None:
         self.context = context
@@ -75,6 +77,9 @@ class PluginFacade:
         )
         self.renderer.max_prompt_tags = max(
             0, int(self.plugin_config.get("max_prompt_tags", 30) or 30)
+        )
+        self.renderer.max_prompt_meme_defs = max(
+            0, int(self.plugin_config.get("max_prompt_meme_defs", 30) or 30)
         )
 
     async def startup(self) -> None:
@@ -95,13 +100,44 @@ class PluginFacade:
         stale_asset_ids = await self.storage.prune_missing_assets()
         if stale_asset_ids:
             logger.info(
-                f"此刻的心情: 启动时清理失效资产 {len(stale_asset_ids)} 个: "
-                + ", ".join(stale_asset_ids[:10])
+                f"此刻的心情: 启动时清理失效资产 {len(stale_asset_ids)} 个"
             )
-        else:
-            logger.info("此刻的心情: 启动时未发现失效资产")
         await self.dedup.initialize()
-        await self._import_default_catalog()
+        await self._prune_orphan_thumbnails()
+
+    async def _prune_orphan_thumbnails(self) -> None:
+        """清理无对应资产的孤兒缩略图。"""
+        thumb_dir = self.paths.data_dir / ".thumbnails"
+        if not thumb_dir.is_dir():
+            return
+
+        def _clean() -> int:
+            removed = 0
+            valid_ids = set()
+            import sqlite3 as _sqlite3
+
+            if self.paths.metadata_db.is_file():
+                try:
+                    with _sqlite3.connect(str(self.paths.metadata_db)) as conn:
+                        valid_ids = {
+                            str(row[0])
+                            for row in conn.execute("SELECT asset_id FROM sticker_assets")
+                        }
+                except Exception:
+                    # 数据库读失败时不做任何清理，避免误删全部缩略图。
+                    return 0
+            for path in thumb_dir.glob("*.webp"):
+                if path.stem not in valid_ids:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+            return removed
+
+        removed_count = await asyncio.to_thread(_clean)
+        if removed_count:
+            logger.info(f"此刻的心情: 启动时清理孤兒缩略图 {removed_count} 个")
 
     async def shutdown(self) -> None:
         await self.storage.close()
@@ -127,16 +163,13 @@ class PluginFacade:
     def summarize_image_source(self, image_source: str) -> str:
         if self._is_remote_image_source(image_source):
             parsed = urlparse(image_source)
-            path = parsed.path or "/"
-            return f"{parsed.scheme}://{parsed.netloc}{path}"
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
         path = Path(image_source)
         return f"local:{path.name or '[unknown]'}"
 
     @staticmethod
     def _normalize_text(value: object) -> str:
-        if value is None:
-            return ""
-        return str(value).strip()
+        return str(value).strip() if value is not None else ""
 
     @classmethod
     def _has_store_emoji_markers(
@@ -159,55 +192,43 @@ class PluginFacade:
 
     @classmethod
     def _is_emoji_type_image(cls, item, raw_image_data: dict | None = None) -> bool:
-        def _is_emoji_summary(summary: object) -> bool:
-            text = cls._normalize_text(summary).lower()
-            return bool(text) and (
-                "表情" in text or "emoji" in text or "sticker" in text
+        def is_summary(value: object) -> bool:
+            text = cls._normalize_text(value).lower()
+            return bool(text) and any(
+                marker in text for marker in ("表情", "emoji", "sticker")
             )
 
-        def _is_sub_type_emoji(sub_type: object) -> bool:
-            if sub_type in (1, "1"):
-                return True
+        def is_emoji_sub_type(value: object) -> bool:
             try:
-                return int(sub_type) == 1
-            except Exception:
+                return int(value) == 1
+            except (TypeError, ValueError):
                 return False
 
-        has_store_markers, _ = cls._has_store_emoji_markers(item, raw_image_data)
-        if has_store_markers:
+        has_markers, _ = cls._has_store_emoji_markers(item, raw_image_data)
+        if has_markers:
             return True
 
-        candidate_payloads: list[dict] = []
+        payloads: list[dict] = []
         if isinstance(raw_image_data, dict):
-            candidate_payloads.append(raw_image_data)
-
+            payloads.append(raw_image_data)
         item_dict = getattr(item, "__dict__", None)
         if isinstance(item_dict, dict):
-            candidate_payloads.append(item_dict)
-
+            payloads.append(item_dict)
         try:
             raw_dict = item.toDict()
             if isinstance(raw_dict, dict):
                 data = raw_dict.get("data")
-                if isinstance(data, dict):
-                    candidate_payloads.append(data)
-                else:
-                    candidate_payloads.append(raw_dict)
+                payloads.append(data if isinstance(data, dict) else raw_dict)
         except Exception:
             pass
 
-        for payload in candidate_payloads:
-            sub_type = payload.get("sub_type")
-            if _is_sub_type_emoji(sub_type):
+        for payload in payloads:
+            if is_emoji_sub_type(payload.get("sub_type")) or is_emoji_sub_type(
+                payload.get("subType")
+            ):
                 return True
-            sub_type = payload.get("subType")
-            if _is_sub_type_emoji(sub_type):
+            if is_summary(payload.get("summary")):
                 return True
-
-            summary = payload.get("summary")
-            if _is_emoji_summary(summary):
-                return True
-
             image_type = cls._normalize_text(
                 payload.get("type")
                 or payload.get("imageType")
@@ -215,16 +236,10 @@ class PluginFacade:
             ).lower()
             if image_type in {"emoji", "sticker", "face", "meme"}:
                 return True
-
             url = cls._normalize_text(payload.get("url"))
             if "vip.qq.com/club/item/parcel" in url or "gxh.vip.qq.com" in url:
                 return True
-
-        sub_type = getattr(item, "subType", None)
-        if _is_sub_type_emoji(sub_type):
-            return True
-
-        return False
+        return is_emoji_sub_type(getattr(item, "subType", None))
 
     @staticmethod
     def extract_image_segment_payloads(raw_message) -> list[dict]:
@@ -235,9 +250,7 @@ class PluginFacade:
             return []
         payloads: list[dict] = []
         for segment in segments:
-            if not isinstance(segment, dict):
-                continue
-            if segment.get("type") != "image":
+            if not isinstance(segment, dict) or segment.get("type") != "image":
                 continue
             data = segment.get("data")
             if isinstance(data, dict):
@@ -257,12 +270,6 @@ class PluginFacade:
                 return value
         return ""
 
-    @staticmethod
-    def _derive_preferred_name(image_url: str) -> str | None:
-        parsed = urlparse(image_url)
-        candidate = Path(parsed.path).name.strip()
-        return candidate or None
-
     async def _validate_image_file(self, image_path: Path) -> bool:
         return await asyncio.to_thread(self._validate_image_file_sync, image_path)
 
@@ -275,22 +282,36 @@ class PluginFacade:
         except (OSError, UnidentifiedImageError):
             return False
 
+    async def _allocate_meme_def(self, candidate: str) -> str:
+        base = normalize_meme_def(candidate)
+        if not base:
+            return ""
+        assets = await self.storage.query_assets()
+        used_defs = {asset.meme_def.casefold() for asset in assets}
+        used_tags = {tag.casefold() for asset in assets for tag in asset.tags}
+        candidate_def = base
+        counter = 2
+        while candidate_def.casefold() in used_defs or candidate_def.casefold() in used_tags:
+            candidate_def = f"{base}_{counter}"
+            counter += 1
+        return candidate_def
+
     async def ingest_local_file(
         self,
         source_path: str,
-        group_name: str,
-        description: str = "",
-        preferred_name: str | None = None,
-        labels: tuple[str, ...] | None = None,
+        meme_def: str,
+        tags: tuple[str, ...] | list[str],
+        description: str,
         source: str = "manual",
     ) -> IngestResult:
+        if self.format_busy:
+            return IngestResult(ok=False, message="旧库格式化进行中，暂时不能导入图片")
         resolved = resolve_user_path(source_path)
         return await self._ingest_resolved_file(
             resolved=resolved,
-            group_name=group_name,
+            meme_def=meme_def,
+            tags=tuple(tags),
             description=description,
-            preferred_name=preferred_name,
-            labels=labels,
             source=source,
             skip_validation=False,
             skip_duplicate_check=False,
@@ -299,11 +320,10 @@ class PluginFacade:
     async def _ingest_resolved_file(
         self,
         resolved: Path,
-        group_name: str,
-        description: str = "",
-        preferred_name: str | None = None,
-        labels: tuple[str, ...] | None = None,
-        source: str = "manual",
+        meme_def: str,
+        tags: tuple[str, ...],
+        description: str,
+        source: str,
         *,
         skip_validation: bool,
         skip_duplicate_check: bool,
@@ -311,52 +331,40 @@ class PluginFacade:
         if not resolved.exists() or not resolved.is_file():
             return IngestResult(ok=False, message=f"图片不存在或不是文件: {resolved}")
         if resolved.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
-            return IngestResult(
-                ok=False,
-                message=f"不支持的图片格式: {resolved.suffix or '无扩展名'}",
-            )
+            return IngestResult(ok=False, message=f"不支持的图片格式: {resolved.suffix or '无扩展名'}")
         if not is_path_within_roots(resolved, self.allowed_image_roots):
             return IngestResult(ok=False, message=f"图片路径超出允许范围: {resolved}")
         if not skip_validation and not await self._validate_image_file(resolved):
             return IngestResult(ok=False, message=f"图片内容无效或已损坏: {resolved}")
-        normalized_group = normalize_category_name(group_name)
+
+        normalized_tags = normalize_tags(tags)
+        normalized_description = str(description or "").strip()
+        if not normalized_description:
+            return IngestResult(ok=False, message="description 不能为空")
+        if not normalized_tags:
+            return IngestResult(ok=False, message="至少需要一个 tag")
+        allocated_def = await self._allocate_meme_def(meme_def)
+        if not allocated_def:
+            return IngestResult(ok=False, message="filename/meme_def 无法规范化")
+
         async with self._ingest_lock:
             if not skip_duplicate_check:
                 duplicate = await self.dedup.find_similar_duplicate(resolved)
                 if duplicate is not None:
                     return IngestResult(
                         ok=False,
-                        message=f"检测到重复资产: {duplicate.asset_id}",
+                        message=f"检测到重复资产: {duplicate.meme_def}",
                         duplicate_of=duplicate.asset_id,
                     )
-            storage_key, original_name = await self.storage.import_file(
-                resolved, normalized_group, preferred_name
-            )
-            await self.storage.upsert_group(
-                StickerGroup(
-                    name=normalized_group, description=(description or "").strip()
-                )
-            )
-            normalized_labels_list: list[str] = []
-            for raw_label in labels or (group_name,):
-                stripped_label = (raw_label or "").strip()
-                if not stripped_label:
-                    continue
-                normalized_label = normalize_tag_display_name(stripped_label)
-                if normalized_label and normalized_label not in normalized_labels_list:
-                    normalized_labels_list.append(normalized_label)
-            normalized_labels = tuple(normalized_labels_list) or (
-                normalize_tag_display_name(group_name),
-            )
+            storage_key, _ = await self.storage.import_file(resolved, allocated_def)
             asset = await self.storage.add_asset(
                 StickerAssetDraft(
-                    group_name=normalized_group,
+                    meme_def=allocated_def,
                     storage_key=storage_key,
-                    original_name=original_name,
                     mime_hint=resolved.suffix.lower(),
-                    description=(description or "").strip(),
+                    description=normalized_description,
                     source=source,
-                    labels=normalized_labels,
+                    tags=normalized_tags,
                 )
             )
             await self.dedup.register_file(
@@ -370,97 +378,77 @@ class PluginFacade:
     async def save_remote_image(
         self,
         image_url: str,
-        group_name: str,
-        description: str = "",
-        preferred_name: str | None = None,
+        meme_def: str,
+        tags: tuple[str, ...] | list[str],
+        description: str,
         source: str = "remote",
-        labels: tuple[str, ...] | None = None,
     ) -> IngestResult:
+        if self.format_busy:
+            return IngestResult(ok=False, message="旧库格式化进行中，暂时不能导入图片")
         temp_file = await self.downloader.download(image_url)
         if temp_file is None:
             return IngestResult(ok=False, message="下载图片失败")
         try:
-            result = await self.ingest_local_file(
+            return await self.ingest_local_file(
                 str(temp_file),
-                group_name,
-                description,
-                preferred_name,
-                labels=labels,
+                meme_def=meme_def,
+                tags=tags,
+                description=description,
                 source=source,
             )
-            return result
         finally:
             self.downloader.cleanup(temp_file)
 
     async def can_accept_more_assets(self, max_stickers: int | None = None) -> bool:
-        limit = (
-            max_stickers
-            if max_stickers is not None
-            else self.plugin_config.get("max_stickers")
-        )
+        limit = max_stickers if max_stickers is not None else self.plugin_config.get("max_stickers")
         if limit in (None, ""):
             return True
         try:
             limit_value = int(limit)
         except (TypeError, ValueError):
             return True
-        if limit_value <= 0:
-            return True
-        return await self.storage.count_assets() < limit_value
+        return limit_value <= 0 or await self.storage.count_assets() < limit_value
 
     async def maybe_auto_collect_image(
         self,
         image_url: str,
-        source_group: str,
+        source_origin: str,
         source_user: str,
     ) -> dict:
+        if self.format_busy:
+            return {"success": False, "message": "旧库格式化进行中，跳过自动采集"}
         sanitized_source = self.summarize_image_source(image_url)
-        logger.info(
-            f"此刻的心情: 开始处理自动采集 source_group={source_group} "
-            f"source_user={self._mask_identifier(source_user)} image_url={sanitized_source}"
-        )
         async with self._inflight_lock:
             if image_url in self.inflight_sources:
-                logger.info(
-                    f"此刻的心情: 跳过重复自动采集任务 image_url={sanitized_source}"
-                )
                 return {"success": False, "message": "图片正在处理，已跳过重复任务"}
             self.inflight_sources.add(image_url)
         if not self._is_remote_image_source(image_url):
-            logger.warning(
-                f"此刻的心情: 自动采集仅支持远程图片源，已跳过 image_url={sanitized_source}"
-            )
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "自动采集仅支持远程图片 URL"}
-        if not await self.can_accept_more_assets(
-            self.plugin_config.get("max_stickers")
-        ):
-            logger.info("此刻的心情: 自动采集跳过，图片资产数量已达到上限")
+        if not await self.can_accept_more_assets(self.plugin_config.get("max_stickers")):
+            async with self._inflight_lock:
+                self.inflight_sources.discard(image_url)
             return {"success": False, "message": "当前图片资产数量已达到上限"}
+
         temp_file: Path | None = None
         try:
             temp_file = await self.downloader.download(image_url)
-            if temp_file is None:
-                return {"success": False, "message": "下载图片失败"}
-            if not await self._validate_image_file(temp_file):
-                return {"success": False, "message": "图片内容无效或已损坏"}
+            if temp_file is None or not await self._validate_image_file(temp_file):
+                return {"success": False, "message": "下载失败或图片内容无效"}
             duplicate = await self.dedup.find_similar_duplicate(temp_file)
             if duplicate is not None:
-                logger.info(
-                    "此刻的心情: 自动采集跳过，检测到重复图片 "
-                    f"asset_id={duplicate.asset_id} image_url={sanitized_source}"
-                )
                 return {
                     "success": False,
-                    "message": f"检测到重复资产: {duplicate.asset_id}",
+                    "message": f"检测到重复资产: {duplicate.meme_def}",
                     "duplicate_of": duplicate.asset_id,
                 }
             review_result = await self.review_remote_image(image_url)
             logger.info(
-                "此刻的心情: 图片审查完成 "
-                f"should_steal={review_result.get('should_steal')} "
-                f"reason={review_result.get('reason')} "
-                f"tags={review_result.get('tags')} "
-                f"filename={review_result.get('filename')}"
+                "此刻的心情: 图片审查完成 should_steal=%s filename=%s tags=%s",
+                review_result.get("should_steal"),
+                review_result.get("filename"),
+                review_result.get("tags"),
             )
             if not review_result.get("should_steal"):
                 return {
@@ -468,41 +456,19 @@ class PluginFacade:
                     "message": str(review_result.get("reason") or "LLM 审查未通过"),
                     "review": review_result,
                 }
-            tags = [
-                str(tag).strip()
-                for tag in review_result.get("tags", [])
-                if str(tag).strip()
-            ]
-            llm_filename = str(review_result.get("filename") or "").strip()
-            if llm_filename:
-                # 防御路径穿越和非法字符，保留原始扩展名
-                base_name = Path(llm_filename).name
-                base_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", base_name).strip()
-                orig_suffix = Path(urlparse(image_url).path).suffix or ".jpg"
-                preferred_name = f"{base_name}{orig_suffix}" if base_name else self._derive_preferred_name(image_url)
-            else:
-                preferred_name = self._derive_preferred_name(image_url)
-            normalized_group = normalize_category_name(
-                tags[0] if tags else DEFAULT_CATEGORY
-            )
             result = await self._ingest_resolved_file(
                 resolved=temp_file,
-                group_name=normalized_group,
-                description=str(review_result.get("reason") or "").strip(),
-                preferred_name=preferred_name,
-                source=f"auto_steal_group:{source_group}_user:{source_user}",
-                labels=tuple(tags) if tags else None,
+                meme_def=str(review_result.get("filename") or ""),
+                tags=tuple(str(tag) for tag in review_result.get("tags", [])),
+                description=str(review_result.get("description") or ""),
+                source=f"auto_steal_origin:{source_origin}_user:{source_user}",
                 skip_validation=True,
                 skip_duplicate_check=True,
-            )
-            logger.info(
-                f"此刻的心情: 自动采集保存完成 ok={result.ok} "
-                f"message={result.message} asset_id={result.asset.asset_id if result.asset else ''}"
             )
             return {
                 "success": result.ok,
                 "message": result.message,
-                "meme_id": result.asset.asset_id if result.asset else "",
+                "meme_def": result.asset.meme_def if result.asset else "",
                 "review": review_result,
             }
         except Exception as exc:
@@ -513,12 +479,12 @@ class PluginFacade:
             async with self._inflight_lock:
                 self.inflight_sources.discard(image_url)
 
-    async def inspect_recent(self, scope_key: str, limit: int = 5):
+    async def inspect_recent(self, scope_key: str, limit: int = 5) -> list[dict]:
         usage_events = await self.storage.list_recent_usage(scope_key, limit)
-        results = []
-        seen_asset_ids: set[str] = set()
+        results: list[dict] = []
+        seen: set[str] = set()
         for event in usage_events:
-            if event.asset_id in seen_asset_ids:
+            if event.asset_id in seen:
                 continue
             asset = await self.storage.get_asset(event.asset_id)
             if asset is None:
@@ -526,28 +492,87 @@ class PluginFacade:
             results.append(
                 {
                     "asset_id": asset.asset_id,
-                    "group_name": asset.group_name,
-                    "original_name": asset.original_name,
+                    "meme_def": asset.meme_def,
                     "description": asset.description,
+                    "tags": list(asset.tags),
                     "usage_count": asset.usage_count,
                 }
             )
-            seen_asset_ids.add(event.asset_id)
-            if len(results) >= limit:
-                break
+            seen.add(event.asset_id)
         return results
 
     async def delete_asset(self, asset_id: str) -> DeleteResult:
         asset = await self.storage.delete_asset(asset_id)
         if asset is None:
-            return DeleteResult(
-                ok=False, message=f"未找到 asset_id={asset_id} 的图片资产。"
-            )
+            return DeleteResult(ok=False, message=f"未找到 asset_id={asset_id} 的图片资产。")
         await self.storage.delete_file(asset.storage_key)
         await self.dedup.unregister_asset(asset)
-        return DeleteResult(
-            ok=True, message=f"已删除图片资产: {asset.asset_id}", asset=asset
-        )
+        # 同步清理缩略图缓存。
+        try:
+            (self.paths.data_dir / ".thumbnails" / f"{asset_id}.webp").unlink(missing_ok=True)
+        except OSError:
+            pass
+        return DeleteResult(ok=True, message=f"已删除图片资产: {asset.meme_def}", asset=asset)
+
+    async def check_meme_def(self, meme_def: str) -> dict | None:
+        return await self.storage.get_meme_by_def(meme_def.strip())
+
+    async def rough_search_memes(self, query: str, limit: int = 8) -> list[dict]:
+        query_text = query.strip().casefold()
+        if not query_text:
+            return []
+        scored: list[tuple[int, dict]] = []
+        for asset in await self.storage.query_assets():
+            key = asset.meme_def.casefold()
+            description = asset.description.casefold()
+            tags = " ".join(asset.tags).casefold()
+            source = asset.source.casefold()
+            score = 0
+            if query_text == key:
+                score += 1000
+            if query_text in key:
+                score += 300
+            if query_text in description:
+                score += 100
+            if query_text in tags:
+                score += 80
+            if query_text in source:
+                score += 20
+            for term in re.findall(r"[\w\u4e00-\u9fff]+", query_text):
+                if term in description:
+                    score += 10
+                if term in tags:
+                    score += 8
+            if score:
+                scored.append(
+                    (
+                        score,
+                        {
+                            "meme_def": asset.meme_def,
+                            "description": asset.description,
+                            "tags": list(asset.tags),
+                            "usage_count": asset.usage_count,
+                        },
+                    )
+                )
+        scored.sort(key=lambda item: (-item[0], item[1]["meme_def"].casefold()))
+        return [item[1] for item in scored[: max(1, min(int(limit), 20))]]
+
+    async def maybe_run_cleanup(self) -> None:
+        if self.format_busy or not self.plugin_config.get("enable_auto_cleanup", True):
+            return
+        interval_hours = int(self.plugin_config.get("cleanup_interval_hours", 1) or 1)
+        cleanup_count = int(self.plugin_config.get("cleanup_count", 5) or 5)
+        min_keep = int(self.plugin_config.get("min_stickers_to_keep", 0) or 0)
+        now = time.time()
+        if self._cleanup_last_run and now - self._cleanup_last_run < interval_hours * 3600:
+            return
+        self._cleanup_last_run = now
+        removable = max(0, await self.storage.count_assets() - max(min_keep, 0))
+        for item in await self.storage.get_least_used_memes(min(cleanup_count, removable)):
+            asset_id = str(item.get("asset_id") or "")
+            if asset_id:
+                await self.delete_asset(asset_id)
 
     def explain_auto_collect_item(
         self, item, raw_image_data: dict | None = None
@@ -555,63 +580,13 @@ class PluginFacade:
         if not self.plugin_config.get("enable_auto_steal", True):
             return False, "enable_auto_steal=false"
         only_store_emojis = self.plugin_config.get("only_store_emojis", False)
-        has_store_markers, matched_attrs = self._has_store_emoji_markers(
-            item, raw_image_data
-        )
+        has_markers, matched_attrs = self._has_store_emoji_markers(item, raw_image_data)
         if only_store_emojis:
-            if has_store_markers:
+            if has_markers:
                 return True, f"only_store_emojis=true，命中特征字段: {', '.join(matched_attrs)}"
-            return False, "only_store_emojis=true 且图片不含 emoji_id/emoji_package_id/key"
+            return False, "only_store_emojis=true 且图片不含商城表情特征"
         if self.plugin_config.get("steal_all_images", False):
             return True, "steal_all_images=true"
         if self._is_emoji_type_image(item, raw_image_data):
-            if matched_attrs:
-                return True, f"命中商城表情字段: {', '.join(matched_attrs)}"
             return True, "命中表情类型图片特征"
         return False, "steal_all_images=false 且图片未命中表情类型特征"
-
-    def should_auto_collect_item(self, item) -> bool:
-        should_collect, _ = self.explain_auto_collect_item(item)
-        return should_collect
-
-    async def maybe_run_cleanup(self) -> None:
-        if not self.plugin_config.get("enable_auto_cleanup", True):
-            return
-        interval_hours = int(self.plugin_config.get("cleanup_interval_hours", 1) or 1)
-        cleanup_count = int(self.plugin_config.get("cleanup_count", 5) or 5)
-        min_keep = int(self.plugin_config.get("min_stickers_to_keep", 0) or 0)
-        now = time.time()
-        if (
-            self._cleanup_last_run
-            and now - self._cleanup_last_run < interval_hours * 3600
-        ):
-            return
-        self._cleanup_last_run = now
-        total_count = await self.storage.count_assets()
-        removable = max(0, total_count - max(min_keep, 0))
-        if removable <= 0:
-            return
-        to_delete = await self.storage.get_least_used_memes(
-            min(cleanup_count, removable)
-        )
-        for item in to_delete:
-            asset_id = str(item.get("meme_id") or "")
-            if asset_id:
-                await self.delete_asset(asset_id)
-
-    async def _import_default_catalog(self) -> None:
-        default_json = self.paths.default_dir / "memes_data.json"
-        if default_json.exists():
-            try:
-                raw_data = json.loads(default_json.read_text(encoding="utf-8"))
-                if isinstance(raw_data, dict):
-                    for category, description in raw_data.items():
-                        normalized = normalize_category_name(category)
-                        await self.storage.upsert_group(
-                            StickerGroup(
-                                name=normalized,
-                                description=str(description or "").strip(),
-                            )
-                        )
-            except Exception as exc:
-                logger.warning(f"此刻的心情: 读取默认分类描述失败: {exc}")

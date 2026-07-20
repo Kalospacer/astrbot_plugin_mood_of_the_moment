@@ -3,30 +3,30 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import shutil
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
 
-from .constants import (
-    DEFAULT_CATEGORY,
-    DEFAULT_CATEGORY_DESCRIPTION,
-)
 from .models import (
     PluginPaths,
     StickerAsset,
     StickerAssetDraft,
-    StickerGroup,
     StickerUsageEvent,
 )
-from .utils import safe_filename
+from .utils import normalize_tags, safe_filename
 
 
 class StickerStorage:
+    _SELECT_COLUMNS = (
+        "asset_id, meme_def, storage_key, mime_hint, description, source, "
+        "created_at, usage_count, last_used_at, tags_json"
+    )
+
     def __init__(self, paths: PluginPaths):
         self.paths = paths
         self._lock = asyncio.Lock()
@@ -38,7 +38,6 @@ class StickerStorage:
         )
         async with self._lock:
             await asyncio.to_thread(self._init_database_sync)
-            await asyncio.to_thread(self._ensure_default_groups_sync)
 
     async def close(self) -> None:
         return None
@@ -49,216 +48,213 @@ class StickerStorage:
         return conn
 
     def _init_database_sync(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sticker_groups (
-                    name TEXT PRIMARY KEY,
-                    description TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
+        self.paths.metadata_db.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self._connect()) as conn:
+            existing = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sticker_assets'"
+            ).fetchone()
+            if existing:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(sticker_assets)")
+                }
+                required = {
+                    "asset_id",
+                    "meme_def",
+                    "storage_key",
+                    "mime_hint",
+                    "description",
+                    "source",
+                    "created_at",
+                    "usage_count",
+                    "last_used_at",
+                    "tags_json",
+                }
+                if not required.issubset(columns):
+                    raise RuntimeError(
+                        "检测到旧版表情包数据库。请先使用 WebUI 的“格式化旧库”功能，"
+                        "不要直接让 v2 运行时读取旧数据库。"
+                    )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sticker_assets (
                     asset_id TEXT PRIMARY KEY,
-                    group_name TEXT NOT NULL,
+                    meme_def TEXT NOT NULL UNIQUE,
                     storage_key TEXT NOT NULL UNIQUE,
-                    original_name TEXT NOT NULL,
                     mime_hint TEXT NOT NULL DEFAULT '',
-                    description TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL,
                     source TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     usage_count INTEGER NOT NULL DEFAULT 0,
                     last_used_at REAL,
-                    labels_json TEXT NOT NULL DEFAULT '[]'
+                    tags_json TEXT NOT NULL
                 )
                 """
             )
             conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sticker_usage (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    asset_id TEXT NOT NULL,
-                    scope_key TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                )
-                """
+                "CREATE INDEX IF NOT EXISTS idx_sticker_assets_created_at ON sticker_assets(created_at)"
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sticker_assets_group_name ON sticker_assets(group_name)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sticker_usage_scope_key ON sticker_usage(scope_key, created_at DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_sticker_assets_usage_count ON sticker_assets(usage_count)"
             )
             conn.commit()
 
-    def _ensure_default_groups_sync(self) -> None:
-        with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) FROM sticker_groups").fetchone()
-            if int(row[0]) == 0:
-                conn.execute(
-                    "INSERT INTO sticker_groups(name, description) VALUES(?, ?)",
-                    (DEFAULT_CATEGORY, DEFAULT_CATEGORY_DESCRIPTION),
-                )
-                conn.commit()
+    @staticmethod
+    def _build_asset_id(meme_def: str) -> str:
+        return f"{meme_def}-{int(time.time() * 1000)}-{os.urandom(4).hex()}"
 
-    def _build_asset_id(self, group_name: str) -> str:
-        return f"{group_name}-{int(time.time() * 1000)}-{os.urandom(4).hex()}"
+    @staticmethod
+    def _tags_to_json(tags: tuple[str, ...]) -> str:
+        return json.dumps(list(tags), ensure_ascii=False)
 
-    def _labels_to_json(self, labels: tuple[str, ...]) -> str:
-        return json.dumps([label for label in labels if label], ensure_ascii=False)
-
-    def _json_to_labels(self, raw_json: str) -> tuple[str, ...]:
+    @staticmethod
+    def _json_to_tags(raw_json: str) -> tuple[str, ...]:
         try:
-            data = json.loads(raw_json or "[]")
-        except Exception as exc:
-            logger.warning(f"此刻的心情: invalid labels_json ignored: {exc}")
+            value = json.loads(raw_json or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning(f"此刻的心情: invalid tags_json ignored: {exc}")
             return ()
-        if not isinstance(data, list):
-            return ()
-        return tuple(str(item).strip() for item in data if str(item).strip())
+        return normalize_tags(value)
 
-    def _row_to_asset(self, row: sqlite3.Row | tuple) -> StickerAsset:
+    def _row_to_asset(self, row: sqlite3.Row) -> StickerAsset:
         return StickerAsset(
-            asset_id=row[0],
-            group_name=row[1],
-            storage_key=row[2],
-            original_name=row[3],
-            mime_hint=row[4],
-            description=row[5],
-            source=row[6],
-            created_at=row[7],
-            usage_count=row[8],
-            last_used_at=row[9],
-            labels=self._json_to_labels(row[10]),
+            asset_id=str(row["asset_id"]),
+            meme_def=str(row["meme_def"]),
+            storage_key=str(row["storage_key"]),
+            mime_hint=str(row["mime_hint"] or ""),
+            description=str(row["description"] or ""),
+            source=str(row["source"] or ""),
+            created_at=float(row["created_at"] or 0.0),
+            usage_count=int(row["usage_count"] or 0),
+            last_used_at=(
+                float(row["last_used_at"])
+                if row["last_used_at"] is not None
+                else None
+            ),
+            tags=self._json_to_tags(str(row["tags_json"] or "[]")),
         )
 
-    async def upsert_group(self, group: StickerGroup) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._upsert_group_sync, group)
-
-    def _upsert_group_sync(self, group: StickerGroup) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sticker_groups(name, description) VALUES(?, ?)
-                ON CONFLICT(name) DO UPDATE SET description = excluded.description
-                """,
-                (group.name, group.description),
-            )
-            conn.commit()
-
-    async def list_groups(self) -> list[StickerGroup]:
-        return await asyncio.to_thread(self._list_groups_sync)
-
-    def _list_groups_sync(self) -> list[StickerGroup]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT name, description FROM sticker_groups ORDER BY name"
-            ).fetchall()
-        return [StickerGroup(name=row[0], description=row[1]) for row in rows]
-
-    async def get_group(self, group_name: str) -> StickerGroup | None:
-        return await asyncio.to_thread(self._get_group_sync, group_name)
-
-    def _get_group_sync(self, group_name: str) -> StickerGroup | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT name, description FROM sticker_groups WHERE name = ?",
-                (group_name,),
-            ).fetchone()
-        return StickerGroup(name=row[0], description=row[1]) if row else None
-
     async def add_asset(self, draft: StickerAssetDraft) -> StickerAsset:
+        if not draft.meme_def.strip():
+            raise ValueError("meme_def 不能为空")
+        if not draft.description.strip():
+            raise ValueError("description 不能为空")
+        tags = normalize_tags(draft.tags)
+        if not tags:
+            raise ValueError("至少需要一个 tag")
         async with self._lock:
-            return await asyncio.to_thread(self._add_asset_sync, draft)
+            return await asyncio.to_thread(
+                self._add_asset_sync,
+                StickerAssetDraft(
+                    meme_def=draft.meme_def.strip(),
+                    storage_key=draft.storage_key,
+                    mime_hint=draft.mime_hint,
+                    description=draft.description.strip(),
+                    source=draft.source,
+                    tags=tags,
+                    usage_count=draft.usage_count,
+                    last_used_at=draft.last_used_at,
+                ),
+            )
 
     def _add_asset_sync(self, draft: StickerAssetDraft) -> StickerAsset:
-        asset_id = self._build_asset_id(draft.group_name)
+        asset_id = self._build_asset_id(draft.meme_def)
         created_at = time.time()
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO sticker_assets(
-                    asset_id, group_name, storage_key, original_name, mime_hint,
-                    description, source, created_at, usage_count, last_used_at, labels_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+                    asset_id, meme_def, storage_key, mime_hint, description, source,
+                    created_at, usage_count, last_used_at, tags_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     asset_id,
-                    draft.group_name,
+                    draft.meme_def,
                     draft.storage_key,
-                    draft.original_name,
                     draft.mime_hint,
                     draft.description,
                     draft.source,
                     created_at,
-                    self._labels_to_json(draft.labels),
+                    draft.usage_count,
+                    draft.last_used_at,
+                    self._tags_to_json(draft.tags),
                 ),
             )
             conn.commit()
         return StickerAsset(
             asset_id=asset_id,
-            group_name=draft.group_name,
+            meme_def=draft.meme_def,
             storage_key=draft.storage_key,
-            original_name=draft.original_name,
             mime_hint=draft.mime_hint,
             description=draft.description,
             source=draft.source,
             created_at=created_at,
-            labels=draft.labels,
+            usage_count=draft.usage_count,
+            last_used_at=draft.last_used_at,
+            tags=draft.tags,
         )
 
     async def query_assets(
         self,
-        group_name: str | None = None,
-        labels: tuple[str, ...] = (),
+        tags: tuple[str, ...] = (),
         limit: int | None = None,
         match_all: bool = True,
     ) -> list[StickerAsset]:
         return await asyncio.to_thread(
-            self._query_assets_sync, group_name, labels, limit, match_all
+            self._query_assets_sync,
+            normalize_tags(tags),
+            limit,
+            match_all,
         )
 
     def _query_assets_sync(
         self,
-        group_name: str | None = None,
-        labels: tuple[str, ...] = (),
-        limit: int | None = None,
-        match_all: bool = True,  # match_all=True表示AND逻辑，False表示OR逻辑
+        tags: tuple[str, ...],
+        limit: int | None,
+        match_all: bool,
     ) -> list[StickerAsset]:
-        sql = "SELECT asset_id, group_name, storage_key, original_name, mime_hint, description, source, created_at, usage_count, last_used_at, labels_json FROM sticker_assets"
-        params: list[object] = []
-        if group_name:
-            sql += " WHERE group_name = ?"
-            params.append(group_name)
-        sql += " ORDER BY usage_count DESC, created_at ASC"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
-        with self._connect() as conn:
-            rows = conn.execute(sql, tuple(params)).fetchall()
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM sticker_assets "
+                "ORDER BY created_at ASC, meme_def ASC"
+            ).fetchall()
         assets = [self._row_to_asset(row) for row in rows]
-        if not labels:
-            return assets
-
-        expected = set(labels)
-        if match_all:
-            # AND逻辑：资源必须包含所有查询的标签
-            return [asset for asset in assets if expected.issubset(set(asset.labels))]
-        else:
-            # OR逻辑：资源包含任意一个查询的标签即可（用于降级匹配）
-            return [asset for asset in assets if expected & set(asset.labels)]
+        if tags:
+            expected = {tag.casefold() for tag in tags}
+            if match_all:
+                assets = [
+                    asset
+                    for asset in assets
+                    if expected.issubset({tag.casefold() for tag in asset.tags})
+                ]
+            else:
+                assets = [
+                    asset
+                    for asset in assets
+                    if expected & {tag.casefold() for tag in asset.tags}
+                ]
+        return assets[:limit] if limit is not None else assets
 
     async def get_asset(self, asset_id: str) -> StickerAsset | None:
         return await asyncio.to_thread(self._get_asset_sync, asset_id)
 
     def _get_asset_sync(self, asset_id: str) -> StickerAsset | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT asset_id, group_name, storage_key, original_name, mime_hint, description, source, created_at, usage_count, last_used_at, labels_json FROM sticker_assets WHERE asset_id = ?",
+                f"SELECT {self._SELECT_COLUMNS} FROM sticker_assets WHERE asset_id = ?",
                 (asset_id,),
+            ).fetchone()
+        return self._row_to_asset(row) if row else None
+
+    async def get_asset_by_meme_def(self, meme_def: str) -> StickerAsset | None:
+        return await asyncio.to_thread(self._get_asset_by_meme_def_sync, meme_def)
+
+    def _get_asset_by_meme_def_sync(self, meme_def: str) -> StickerAsset | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM sticker_assets WHERE meme_def = ?",
+                (meme_def,),
             ).fetchone()
         return self._row_to_asset(row) if row else None
 
@@ -266,9 +262,9 @@ class StickerStorage:
         return await asyncio.to_thread(self._get_asset_by_storage_key_sync, storage_key)
 
     def _get_asset_by_storage_key_sync(self, storage_key: str) -> StickerAsset | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT asset_id, group_name, storage_key, original_name, mime_hint, description, source, created_at, usage_count, last_used_at, labels_json FROM sticker_assets WHERE storage_key = ?",
+                f"SELECT {self._SELECT_COLUMNS} FROM sticker_assets WHERE storage_key = ?",
                 (storage_key,),
             ).fetchone()
         return self._row_to_asset(row) if row else None
@@ -281,7 +277,7 @@ class StickerStorage:
         asset = self._get_asset_sync(asset_id)
         if asset is None:
             return None
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute("DELETE FROM sticker_usage WHERE asset_id = ?", (asset_id,))
             conn.execute("DELETE FROM sticker_assets WHERE asset_id = ?", (asset_id,))
             conn.commit()
@@ -291,89 +287,75 @@ class StickerStorage:
         self,
         asset_id: str,
         *,
-        group_name: str | None = None,
+        meme_def: str | None = None,
         description: str | None = None,
         source: str | None = None,
-        labels: tuple[str, ...] | None = None,
+        tags: tuple[str, ...] | None = None,
     ) -> StickerAsset | None:
         async with self._lock:
             return await asyncio.to_thread(
                 self._update_asset_metadata_sync,
                 asset_id,
-                group_name,
+                meme_def,
                 description,
                 source,
-                labels,
+                tags,
             )
 
     def _update_asset_metadata_sync(
         self,
         asset_id: str,
-        group_name: str | None = None,
-        description: str | None = None,
-        source: str | None = None,
-        labels: tuple[str, ...] | None = None,
+        meme_def: str | None,
+        description: str | None,
+        source: str | None,
+        tags: tuple[str, ...] | None,
     ) -> StickerAsset | None:
         asset = self._get_asset_sync(asset_id)
         if asset is None:
             return None
+        target_def = (meme_def or asset.meme_def).strip()
+        target_description = asset.description if description is None else description.strip()
+        target_tags = asset.tags if tags is None else normalize_tags(tags)
+        if not target_def or not target_description or not target_tags:
+            raise ValueError("meme_def、description 和 tags 都不能为空")
 
-        target_group = (group_name or asset.group_name).strip() or asset.group_name
-        storage_key = asset.storage_key
-        original_name = asset.original_name
         current_path = self._resolve_path_sync(asset.storage_key)
-
-        if target_group != asset.group_name:
-            target_dir = self.paths.stickers_dir / target_group
-            safe_name = safe_filename(
-                original_name,
-                current_path.suffix or asset.mime_hint or ".jpg",
+        target_path = current_path
+        storage_key = asset.storage_key
+        if target_def != asset.meme_def:
+            target_path = self.paths.stickers_dir / safe_filename(
+                target_def, current_path.suffix or asset.mime_hint or ".png"
             )
-            target_path = target_dir / safe_name
+            if target_path.exists() and target_path.resolve() != current_path.resolve():
+                raise ValueError(f"目标 meme_def 文件已存在: {target_def}")
             if current_path.exists():
-                target_dir.mkdir(parents=True, exist_ok=True)
-                if target_path.exists() and target_path.resolve() != current_path.resolve():
-                    target_path = (
-                        target_dir
-                        / f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
-                    )
+                target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(current_path), str(target_path))
-                self._cleanup_empty_parent_dirs_sync(current_path.parent)
             storage_key = str(target_path.relative_to(self.paths.stickers_dir)).replace(
                 "\\", "/"
             )
-            original_name = target_path.name
 
-        next_labels = labels if labels is not None else asset.labels
         try:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO sticker_groups(name, description) VALUES(?, '')
-                    ON CONFLICT(name) DO NOTHING
-                    """,
-                    (target_group,),
-                )
+            with closing(self._connect()) as conn:
                 conn.execute(
                     """
                     UPDATE sticker_assets
-                    SET group_name = ?, storage_key = ?, original_name = ?,
-                        description = ?, source = ?, labels_json = ?
+                    SET meme_def = ?, storage_key = ?, description = ?,
+                        source = ?, tags_json = ?
                     WHERE asset_id = ?
                     """,
                     (
-                        target_group,
+                        target_def,
                         storage_key,
-                        original_name,
-                        asset.description if description is None else description,
-                        asset.source if source is None else source,
-                        self._labels_to_json(next_labels),
+                        target_description,
+                        asset.source if source is None else source.strip(),
+                        self._tags_to_json(target_tags),
                         asset_id,
                     ),
                 )
                 conn.commit()
         except Exception:
-            if target_group != asset.group_name and 'target_path' in locals() and target_path.exists() and not current_path.exists():
+            if target_path != current_path and target_path.exists() and not current_path.exists():
                 current_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(target_path), str(current_path))
             raise
@@ -383,7 +365,7 @@ class StickerStorage:
         return await asyncio.to_thread(self._count_assets_sync)
 
     def _count_assets_sync(self) -> int:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute("SELECT COUNT(*) FROM sticker_assets").fetchone()
         return int(row[0]) if row else 0
 
@@ -392,37 +374,33 @@ class StickerStorage:
             return await asyncio.to_thread(self._prune_missing_assets_sync)
 
     def _prune_missing_assets_sync(self) -> list[str]:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT asset_id, storage_key FROM sticker_assets"
             ).fetchall()
-            stale_asset_ids: list[str] = []
-            for row in rows:
-                asset_id = str(row[0] or "").strip()
-                storage_key = str(row[1] or "").strip()
-                if not asset_id or not storage_key:
-                    continue
-                if not self._resolve_path_sync(storage_key).exists():
-                    stale_asset_ids.append(asset_id)
-            if not stale_asset_ids:
-                return []
-            conn.executemany(
-                "DELETE FROM sticker_usage WHERE asset_id = ?",
-                [(asset_id,) for asset_id in stale_asset_ids],
-            )
-            conn.executemany(
-                "DELETE FROM sticker_assets WHERE asset_id = ?",
-                [(asset_id,) for asset_id in stale_asset_ids],
-            )
-            conn.commit()
-        return stale_asset_ids
+            stale = [
+                str(row[0])
+                for row in rows
+                if not self._resolve_path_sync(str(row[1])).exists()
+            ]
+            if stale:
+                conn.executemany(
+                    "DELETE FROM sticker_usage WHERE asset_id = ?",
+                    [(asset_id,) for asset_id in stale],
+                )
+                conn.executemany(
+                    "DELETE FROM sticker_assets WHERE asset_id = ?",
+                    [(asset_id,) for asset_id in stale],
+                )
+                conn.commit()
+        return stale
 
     async def record_usage(self, event: StickerUsageEvent) -> None:
         async with self._lock:
             await asyncio.to_thread(self._record_usage_sync, event)
 
     def _record_usage_sync(self, event: StickerUsageEvent) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 "INSERT INTO sticker_usage(asset_id, scope_key, created_at) VALUES(?, ?, ?)",
                 (event.asset_id, event.scope_key, event.created_at),
@@ -441,43 +419,29 @@ class StickerStorage:
     def _list_recent_usage_sync(
         self, scope_key: str, limit: int
     ) -> list[StickerUsageEvent]:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT asset_id, scope_key, created_at FROM sticker_usage WHERE scope_key = ? ORDER BY created_at DESC LIMIT ?",
+                "SELECT asset_id, scope_key, created_at FROM sticker_usage "
+                "WHERE scope_key = ? ORDER BY created_at DESC LIMIT ?",
                 (scope_key, limit),
             ).fetchall()
         return [
-            StickerUsageEvent(asset_id=row[0], scope_key=row[1], created_at=row[2])
+            StickerUsageEvent(
+                asset_id=str(row[0]), scope_key=str(row[1]), created_at=float(row[2])
+            )
             for row in rows
         ]
 
-    async def import_file(
-        self,
-        source_path: Path,
-        group_name: str,
-        preferred_name: str | None = None,
-    ) -> tuple[str, str]:
-        return await asyncio.to_thread(
-            self._import_file_sync, source_path, group_name, preferred_name
-        )
+    async def import_file(self, source_path: Path, meme_def: str) -> tuple[str, str]:
+        return await asyncio.to_thread(self._import_file_sync, source_path, meme_def)
 
-    def _import_file_sync(
-        self,
-        source_path: Path,
-        group_name: str,
-        preferred_name: str | None = None,
-    ) -> tuple[str, str]:
+    def _import_file_sync(self, source_path: Path, meme_def: str) -> tuple[str, str]:
         self.paths.stickers_dir.mkdir(parents=True, exist_ok=True)
-        target_dir = self.paths.stickers_dir / group_name
-        target_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = safe_filename(
-            preferred_name or source_path.name, source_path.suffix or ".jpg"
-        )
-        target_path = target_dir / safe_name
+        suffix = source_path.suffix.lower() or ".png"
+        target_path = self.paths.stickers_dir / safe_filename(meme_def, suffix)
         if target_path.exists():
-            target_path = (
-                target_dir
-                / f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
+            target_path = self.paths.stickers_dir / (
+                f"{target_path.stem}_{int(time.time() * 1000)}{target_path.suffix}"
             )
         shutil.copy2(source_path, target_path)
         storage_key = str(target_path.relative_to(self.paths.stickers_dir)).replace(
@@ -498,64 +462,74 @@ class StickerStorage:
         await asyncio.to_thread(self._delete_file_sync, storage_key)
 
     def _delete_file_sync(self, storage_key: str) -> None:
-        target = self._resolve_path_sync(storage_key)
-        target.unlink(missing_ok=True)
-        self._cleanup_empty_parent_dirs_sync(target.parent)
-
-    def _cleanup_empty_parent_dirs_sync(self, parent: Path) -> None:
-        stickers_root = self.paths.stickers_dir.resolve()
-        try:
-            parent = parent.resolve()
-            parent.relative_to(stickers_root)
-        except ValueError:
-            return
-        while parent != stickers_root and parent.exists():
-            try:
-                next(parent.iterdir())
-                break
-            except StopIteration:
-                parent.rmdir()
-                parent = parent.parent
-            except OSError:
-                break
-
-    async def iter_all_assets(self) -> list[StickerAsset]:
-        return await self.query_assets()
+        self._resolve_path_sync(storage_key).unlink(missing_ok=True)
 
     async def get_all_tags(self) -> list[str]:
         assets = await self.query_assets()
-        tags: set[str] = set()
-        for asset in assets:
-            tags.update(asset.labels or (asset.group_name,))
-        return sorted(tags)
+        return sorted({tag for asset in assets for tag in asset.tags}, key=str.casefold)
+
+    async def get_all_meme_defs(self, limit: int | None = None) -> list[str]:
+        assets = await self.query_assets()
+        definitions = sorted(
+            {asset.meme_def for asset in assets}, key=str.casefold
+        )
+        return definitions[:limit] if limit is not None else definitions
 
     async def get_tag_index(self) -> dict[str, list[str]]:
         assets = await self.query_assets()
         index: dict[str, list[str]] = {}
         for asset in assets:
-            for tag in asset.labels or (asset.group_name,):
+            for tag in asset.tags:
                 index.setdefault(tag, []).append(asset.asset_id)
         return index
 
     async def get_memes_by_tags(
         self, tags: list[str], match_all: bool = True
     ) -> list[dict[str, Any]]:
-        normalized = tuple(tag for tag in tags if tag)
-        assets = await self.query_assets(labels=normalized, match_all=match_all)
-        result = []
+        assets = await self.query_assets(
+            tags=normalize_tags(tags), match_all=match_all
+        )
+        result: list[dict[str, Any]] = []
         for asset in assets:
             resolved_path = await self.resolve_path(asset.storage_key)
             result.append(
                 {
-                    "meme_id": asset.asset_id,
+                    "asset_id": asset.asset_id,
+                    "meme_def": asset.meme_def,
                     "file_path": str(resolved_path),
-                    "tags": list(asset.labels) or [asset.group_name],
+                    "tags": list(asset.tags),
+                    "description": asset.description,
                     "source": asset.source,
                     "usage_count": asset.usage_count,
+                    "last_used_at": asset.last_used_at,
                     "added_time": asset.created_at,
                 }
             )
         return result
+
+    async def get_meme_by_def(self, meme_def: str) -> dict[str, Any] | None:
+        asset = await self.get_asset_by_meme_def(meme_def)
+        return await self._asset_to_dict(asset) if asset else None
+
+    async def get_meme_by_id(self, asset_id: str) -> dict[str, Any] | None:
+        asset = await self.get_asset(asset_id)
+        return await self._asset_to_dict(asset) if asset else None
+
+    async def _asset_to_dict(self, asset: StickerAsset | None) -> dict[str, Any] | None:
+        if asset is None:
+            return None
+        resolved_path = await self.resolve_path(asset.storage_key)
+        return {
+            "asset_id": asset.asset_id,
+            "meme_def": asset.meme_def,
+            "file_path": str(resolved_path),
+            "tags": list(asset.tags),
+            "description": asset.description,
+            "source": asset.source,
+            "usage_count": asset.usage_count,
+            "last_used_at": asset.last_used_at,
+            "added_time": asset.created_at,
+        }
 
     async def increment_usage_count(
         self, asset_id: str, scope_key: str = "legacy-render"
@@ -566,92 +540,6 @@ class StickerStorage:
             )
         )
 
-    async def update_asset_source(self, asset_id: str, source: str) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._update_asset_source_sync, asset_id, source)
-
-    def _update_asset_source_sync(self, asset_id: str, source: str) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE sticker_assets SET source = ? WHERE asset_id = ?",
-                (source, asset_id),
-            )
-            conn.commit()
-
-    async def save_meme_with_tags(
-        self,
-        meme_id: str,
-        file_path: str,
-        tags: list[str],
-        source: str = "",
-    ) -> bool:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._save_meme_with_tags_sync,
-                meme_id,
-                file_path,
-                tags,
-                source,
-            )
-
-    def _save_meme_with_tags_sync(
-        self,
-        meme_id: str,
-        file_path: str,
-        tags: list[str],
-        source: str = "",
-    ) -> bool:
-        try:
-            candidate_path = Path(file_path)
-            stickers_root = self.paths.stickers_dir.resolve()
-            if candidate_path.is_absolute():
-                resolved_path = candidate_path.resolve()
-            else:
-                resolved_path = (stickers_root / candidate_path).resolve()
-            normalized_storage_key = str(
-                resolved_path.relative_to(stickers_root)
-            ).replace("\\", "/")
-            group_name = tags[0] if tags else DEFAULT_CATEGORY
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO sticker_groups(name, description) VALUES(?, ?)
-                    ON CONFLICT(name) DO UPDATE SET description = excluded.description
-                    """,
-                    (
-                        group_name,
-                        DEFAULT_CATEGORY_DESCRIPTION
-                        if group_name == DEFAULT_CATEGORY
-                        else "",
-                    ),
-                )
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO sticker_assets(
-                        asset_id, group_name, storage_key, original_name, mime_hint,
-                        description, source, created_at, usage_count, last_used_at, labels_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT usage_count FROM sticker_assets WHERE asset_id = ?), 0), COALESCE((SELECT last_used_at FROM sticker_assets WHERE asset_id = ?), NULL), ?)
-                    """,
-                    (
-                        meme_id,
-                        group_name,
-                        normalized_storage_key,
-                        Path(file_path).name,
-                        Path(file_path).suffix.lower(),
-                        ", ".join(tags),
-                        source,
-                        time.time(),
-                        meme_id,
-                        meme_id,
-                        self._labels_to_json(tuple(tags)),
-                    ),
-                )
-                conn.commit()
-            return True
-        except Exception as exc:
-            logger.error(f"此刻的心情: 保存带标签表情包失败: {exc}", exc_info=True)
-            return False
-
     async def get_sticker_count(self) -> int:
         return await self.count_assets()
 
@@ -659,7 +547,6 @@ class StickerStorage:
         assets = await self.query_assets()
         total_count = len(assets)
         total_usage = sum(asset.usage_count for asset in assets)
-        avg_usage = total_usage / total_count if total_count else 0
         least_used = min(
             assets, key=lambda item: (item.usage_count, item.created_at), default=None
         )
@@ -669,15 +556,15 @@ class StickerStorage:
         return {
             "total_count": total_count,
             "total_usage": total_usage,
-            "avg_usage": avg_usage,
+            "avg_usage": total_usage / total_count if total_count else 0,
             "least_used": {
-                "meme_id": least_used.asset_id,
+                "meme_def": least_used.meme_def,
                 "usage_count": least_used.usage_count,
             }
             if least_used
             else None,
             "most_used": {
-                "meme_id": most_used.asset_id,
+                "meme_def": most_used.meme_def,
                 "usage_count": most_used.usage_count,
             }
             if most_used
@@ -689,85 +576,28 @@ class StickerStorage:
             await self.query_assets(),
             key=lambda item: (item.usage_count, item.created_at),
         )[:count]
-        result = []
+        result: list[dict[str, Any]] = []
         for asset in assets:
-            resolved_path = await self.resolve_path(asset.storage_key)
-            result.append(
-                {
-                    "meme_id": asset.asset_id,
-                    "file_path": str(resolved_path),
-                    "tags": list(asset.labels) or [asset.group_name],
-                    "source": asset.source,
-                    "usage_count": asset.usage_count,
-                    "added_time": asset.created_at,
-                }
-            )
+            item = await self._asset_to_dict(asset)
+            if item:
+                result.append(item)
         return result
-
-    async def get_random_sticker_path(self, category: str) -> str | None:
-        assets = await self.query_assets(group_name=category)
-        if not assets:
-            return None
-        asset = random.choice(assets)
-        await self.record_usage(
-            StickerUsageEvent(
-                asset_id=asset.asset_id,
-                scope_key="legacy-storage-random",
-                created_at=time.time(),
-            )
-        )
-        resolved_path = await self.resolve_path(asset.storage_key)
-        return str(resolved_path)
-
-    async def get_catalog_stickers_data(self) -> dict[str, str]:
-        return {group.name: group.description for group in await self.list_groups()}
-
-    async def get_available_stickers_data(self) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for group in await self.list_groups():
-            if await self.query_assets(group_name=group.name, limit=1):
-                result[group.name] = group.description
-        return result
-
-    async def get_catalog_description(self, category: str) -> str | None:
-        group = await self.get_group(category)
-        return group.description if group else None
-
-    async def has_sticker_assets(self, category: str) -> bool:
-        return bool(await self.query_assets(group_name=category, limit=1))
 
     async def get_all_memes(self) -> list[dict[str, Any]]:
-        return await self.get_memes_by_tags([])
-
-    async def get_meme_by_id(self, asset_id: str) -> dict[str, Any] | None:
-        asset = await self.get_asset(asset_id)
-        if asset is None:
-            return None
-        resolved_path = await self.resolve_path(asset.storage_key)
-        return {
-            "meme_id": asset.asset_id,
-            "file_path": str(resolved_path),
-            "tags": list(asset.labels) or [asset.group_name],
-            "source": asset.source,
-            "usage_count": asset.usage_count,
-            "added_time": asset.created_at,
-        }
+        result: list[dict[str, Any]] = []
+        for asset in await self.query_assets():
+            item = await self._asset_to_dict(asset)
+            if item:
+                result.append(item)
+        return result
 
     async def get_meme_by_file_path(
         self, file_path: str | Path
     ) -> dict[str, Any] | None:
         target = Path(file_path).resolve()
         for asset in await self.query_assets():
-            resolved_path = await self.resolve_path(asset.storage_key)
-            if resolved_path == target:
-                return {
-                    "meme_id": asset.asset_id,
-                    "file_path": str(target),
-                    "tags": list(asset.labels) or [asset.group_name],
-                    "source": asset.source,
-                    "usage_count": asset.usage_count,
-                    "added_time": asset.created_at,
-                }
+            if await self.resolve_path(asset.storage_key) == target:
+                return await self._asset_to_dict(asset)
         return None
 
     async def delete_meme(self, asset_id: str) -> bool:

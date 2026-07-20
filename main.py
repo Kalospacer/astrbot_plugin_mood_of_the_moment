@@ -10,15 +10,21 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.agent.message import TextPart
 
-from .constants import PLUGIN_NAME, PLUGIN_PACKAGE_NAME, PLUGIN_VERSION, STEAL_TOOL_NAME
+from .constants import (
+    CHECK_MEMES_DEF_TOOL_NAME,
+    PLUGIN_NAME,
+    PLUGIN_PACKAGE_NAME,
+    PLUGIN_VERSION,
+    ROUGH_SEARCH_MEMES_TOOL_NAME,
+    STEAL_TOOL_NAME,
+)
 from .facade import PluginFacade
 from .models import PluginPaths
 from .page_api import MoodPageApi
-from .tooling import StealMemesTool
+from .tooling import CheckMemesDefTool, RoughSearchMemesTool, StealMemesTool
 
 
 def _inject_sticker_reminder(req: ProviderRequest, summary: str) -> None:
-    """将动态标签库作为临时用户消息内容注入，不修改 system_prompt。"""
     if not summary.strip():
         return
     if not req.extra_user_content_parts:
@@ -29,7 +35,7 @@ def _inject_sticker_reminder(req: ProviderRequest, summary: str) -> None:
 @register(
     PLUGIN_PACKAGE_NAME,
     "Kalo",
-    "此刻的心情：纯净重写版 AstrBot 表情包插件。",
+    "此刻的心情：meme_def 精确选图与 tag 分组表情包插件。",
     PLUGIN_VERSION,
 )
 class MoodOfTheMomentPlugin(Star):
@@ -42,18 +48,34 @@ class MoodOfTheMomentPlugin(Star):
         self.paths = PluginPaths(
             plugin_dir=self.plugin_dir,
             data_dir=self.data_dir,
-            stickers_dir=self.data_dir / "stickers",
-            metadata_db=self.data_dir / "stickers.sqlite3",
-            default_dir=self.plugin_dir / "default",
+            stickers_dir=self.data_dir / "meme_defs",
+            metadata_db=self.data_dir / "meme_defs.sqlite3",
         )
         self.facade = PluginFacade(
             paths=self.paths, context=context, plugin_config=self.config
         )
         self.steal_tool = StealMemesTool(facade=self.facade)
+        self.check_memes_def_tool = CheckMemesDefTool(facade=self.facade)
+        self.rough_search_memes_tool = RoughSearchMemesTool(facade=self.facade)
         self.page_api = MoodPageApi(self)
         self._auto_collect_tasks: set[asyncio.Task] = set()
-        StarTools.unregister_llm_tool(STEAL_TOOL_NAME)
-        self.context.add_llm_tools(self.steal_tool)
+        for tool_name in (
+            STEAL_TOOL_NAME,
+            CHECK_MEMES_DEF_TOOL_NAME,
+            ROUGH_SEARCH_MEMES_TOOL_NAME,
+            "steal_memes",
+            "check_memes",
+            "rough_search",
+            "mood_of_the_moment_steal_memes",
+            "mood_of_the_moment_check_memes_def",
+            "mood_of_the_moment_rough_search_memes",
+        ):
+            StarTools.unregister_llm_tool(tool_name)
+        self.context.add_llm_tools(
+            self.steal_tool,
+            self.check_memes_def_tool,
+            self.rough_search_memes_tool,
+        )
 
     def _finalize_task(self, task: asyncio.Task) -> None:
         self._auto_collect_tasks.discard(task)
@@ -80,6 +102,8 @@ class MoodOfTheMomentPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
+        if self.facade.format_busy:
+            return
         message_chain = getattr(event.message_obj, "message", None)
         if not message_chain:
             return
@@ -103,32 +127,22 @@ class MoodOfTheMomentPlugin(Star):
             image_url = self.facade.get_image_source(item, raw_image_data)
             logger.info(
                 f"{PLUGIN_NAME}: 收到图片消息 unified_msg_origin={event.unified_msg_origin} "
-                f"group_id={self.facade._mask_identifier(str(event.get_group_id()))} "
-                f"sender_id={self.facade._mask_identifier(str(event.get_sender_id()))} "
                 f"image_url={self.facade.summarize_image_source(image_url or '')} "
                 f"decision={should_collect} reason={reason}"
             )
-            if not should_collect:
-                continue
-            if not image_url:
-                logger.warning(f"{PLUGIN_NAME}: 图片消息缺少 url/path，跳过自动采集")
+            if not should_collect or not image_url:
                 continue
             task = asyncio.create_task(
                 self.facade.maybe_auto_collect_image(
                     image_url=image_url,
-                    source_group=str(event.get_group_id()),
+                    source_origin=str(event.get_group_id()),
                     source_user=str(event.get_sender_id()),
                 )
             )
             self._track_task(task)
-            logger.info(
-                f"{PLUGIN_NAME}: 已创建自动采集任务 "
-                f"image_url={self.facade.summarize_image_source(image_url)}"
-            )
             scheduled = True
         if scheduled:
-            cleanup_task = asyncio.create_task(self.facade.maybe_run_cleanup())
-            self._track_task(cleanup_task)
+            self._track_task(asyncio.create_task(self.facade.maybe_run_cleanup()))
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -159,20 +173,19 @@ class MoodOfTheMomentPlugin(Star):
 
     @filter.command("mood_check")
     async def check_meme(self, event: AstrMessageEvent, limit: int = 5) -> None:
-        limit = max(1, min(limit, 20))
         items = await self.facade.inspect_recent(
             scope_key=event.unified_msg_origin,
-            limit=limit,
+            limit=max(1, min(limit, 20)),
         )
         if not items:
-            await event.send(
-                MessageChain().message("当前会话里还没有此刻的心情插件发出的图片记录。")
-            )
+            await event.send(MessageChain().message("当前会话还没有此刻的心情图片记录。"))
             return
         lines = [f"当前会话最近 {len(items)} 条图片资产记录："]
         for index, item in enumerate(items, start=1):
             lines.append(
-                f"{index}. asset_id={item['asset_id']} | group={item['group_name']} | file={item['original_name']} | usage={item['usage_count']}"
+                f"{index}. meme_def={item['meme_def']} | "
+                f"tags={','.join(item['tags'])} | usage={item['usage_count']}\n"
+                f"   {item['description']}"
             )
         await event.send(MessageChain().message("\n".join(lines)))
 
@@ -183,15 +196,18 @@ class MoodOfTheMomentPlugin(Star):
     ) -> None:
         normalized_asset_id = asset_id.strip()
         if not normalized_asset_id:
-            await event.send(
-                MessageChain().message("请使用 mood_delete <asset_id> 删除图片资产。")
-            )
+            await event.send(MessageChain().message("请使用 mood_delete <asset_id> 删除图片资产。"))
             return
         result = await self.facade.delete_asset(normalized_asset_id)
         await event.send(MessageChain().message(result.message))
 
     async def terminate(self):
-        StarTools.unregister_llm_tool(self.steal_tool.name)
+        for tool_name in (
+            STEAL_TOOL_NAME,
+            CHECK_MEMES_DEF_TOOL_NAME,
+            ROUGH_SEARCH_MEMES_TOOL_NAME,
+        ):
+            StarTools.unregister_llm_tool(tool_name)
         if self._auto_collect_tasks:
             for task in list(self._auto_collect_tasks):
                 task.cancel()

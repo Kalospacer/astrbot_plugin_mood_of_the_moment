@@ -27,12 +27,12 @@ class ReviewService:
         if self.context is None:
             return None
         try:
-            provider_id = self.plugin_config.get("tag_provider_id", "")
+            provider_id = self.plugin_config.get("meme_review_provider_id", "")
             if provider_id:
                 return self.context.get_provider_by_id(provider_id)
             return self.context.get_using_provider() or None
         except Exception as exc:
-            logger.error(f"此刻的心情: 获取 provider 失败: {exc}", exc_info=True)
+            logger.error(f"此刻的心情: 获取 review provider 失败: {exc}", exc_info=True)
             return None
 
     def _get_review_prompt(self) -> str:
@@ -40,69 +40,88 @@ class ReviewService:
         return prompt or DEFAULT_REVIEW_SYSTEM_PROMPT
 
     @staticmethod
-    def _parse_should_steal(raw_value) -> bool:
-        if isinstance(raw_value, bool):
-            return raw_value
-        if isinstance(raw_value, (int, float)):
-            return raw_value != 0
-        if isinstance(raw_value, str):
-            normalized = raw_value.strip().lower()
-            if normalized in {"true", "1", "yes"}:
-                return True
-            if normalized in {"false", "0", "no"}:
-                return False
+    def _parse_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes"}
         return False
 
     @staticmethod
+    def _extract_json(text: str) -> dict | None:
+        decoder = json.JSONDecoder()
+        start = text.find("{")
+        while start >= 0:
+            try:
+                value, _ = decoder.raw_decode(text[start:])
+                return value if isinstance(value, dict) else None
+            except json.JSONDecodeError:
+                start = text.find("{", start + 1)
+        return None
+
+    @staticmethod
     def _fallback_should_steal(result_text: str) -> bool:
-        text_lower = result_text.lower()
-        if any(marker in text_lower for marker in FALLBACK_REVIEW_NEGATIVE_MARKERS):
+        lowered = result_text.lower()
+        if any(marker in lowered for marker in FALLBACK_REVIEW_NEGATIVE_MARKERS):
             return False
-        return any(marker in text_lower for marker in FALLBACK_REVIEW_POSITIVE_MARKERS)
+        return any(marker in lowered for marker in FALLBACK_REVIEW_POSITIVE_MARKERS)
+
+    @staticmethod
+    def _empty_result(reason: str) -> dict:
+        return {
+            "should_steal": False,
+            "reason": reason,
+            "description": "",
+            "filename": "",
+            "tags": [],
+        }
 
     async def review_image(self, image_url: str) -> dict:
         provider = self._get_provider()
         if provider is None:
-            return {
-                "should_steal": False,
-                "reason": "未找到可用的 LLM 提供商，无法审查图片",
-                "tags": [],
-                "filename": "",
-            }
+            return self._empty_result("未找到可用的 LLM 提供商，无法审查图片")
         try:
             response = await provider.text_chat(
                 prompt=self._get_review_prompt(), image_urls=[image_url]
             )
-            if response is None or not hasattr(response, "completion_text"):
-                return {"should_steal": False, "reason": "LLM 返回结果为空", "tags": [], "filename": ""}
-            result_text = response.completion_text.strip()
-            json_match = re.search(r"\{[^}]*\}", result_text, re.DOTALL)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                    tags = result.get("tags", [])
-                    filename = str(result.get("filename", "") or "").strip()
-                    return {
-                        "should_steal": self._parse_should_steal(
-                            result.get("should_steal", False)
-                        ),
-                        "reason": str(result.get("reason", "未知")),
-                        "tags": list(tags) if isinstance(tags, list) else [],
-                        "filename": filename,
-                    }
-                except json.JSONDecodeError:
-                    pass
-            should_steal = self._fallback_should_steal(result_text)
-            tags = []
-            if should_steal:
-                tag_matches = re.findall(r'["\']([^"\']{2,10})["\']', result_text)
-                tags = tag_matches[:4] if tag_matches else ["未分类"]
+            result_text = str(getattr(response, "completion_text", "") or "").strip()
+            if not result_text:
+                return self._empty_result("LLM 返回结果为空")
+            payload = self._extract_json(result_text)
+            if payload is None:
+                return self._empty_result("LLM 未返回合法 JSON")
+
+            should_steal = self._parse_bool(payload.get("should_steal"))
+            reason = str(payload.get("reason") or "未知").strip()
+            description = str(payload.get("description") or "").strip()
+            filename = str(payload.get("filename") or "").strip()
+            raw_tags = payload.get("tags")
+            tags = (
+                [str(item).strip() for item in raw_tags if str(item).strip()]
+                if isinstance(raw_tags, list)
+                else []
+            )
+            if not should_steal:
+                return {
+                    "should_steal": False,
+                    "reason": reason,
+                    "description": description,
+                    "filename": filename,
+                    "tags": tags,
+                }
+            if not description or not filename or not tags:
+                return self._empty_result(
+                    "LLM 判定可以保存，但缺少 filename、description 或 tags"
+                )
             return {
-                "should_steal": should_steal,
-                "reason": result_text[:200] if not should_steal else "判断为表情包",
+                "should_steal": True,
+                "reason": reason,
+                "description": description,
+                "filename": filename,
                 "tags": tags,
-                "filename": "",
             }
         except Exception as exc:
-            logger.error(f"此刻的心情: LLM 审查图片失败: {exc}", exc_info=True)
-            return {"should_steal": False, "reason": f"审查过程出错: {exc}", "tags": [], "filename": ""}
+            logger.error(f"此刻的心情: LLM 识图失败: {exc}", exc_info=True)
+            return self._empty_result(f"识图过程出错: {exc}")

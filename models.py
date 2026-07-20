@@ -10,39 +10,32 @@ class PluginPaths:
     data_dir: Path
     stickers_dir: Path
     metadata_db: Path
-    default_dir: Path
-
-
-@dataclass(slots=True)
-class StickerGroup:
-    name: str
-    description: str = ""
 
 
 @dataclass(slots=True)
 class StickerAsset:
     asset_id: str
-    group_name: str
+    meme_def: str
     storage_key: str
-    original_name: str
     mime_hint: str = ""
     description: str = ""
     source: str = ""
     created_at: float = 0.0
     usage_count: int = 0
     last_used_at: float | None = None
-    labels: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
 class StickerAssetDraft:
-    group_name: str
+    meme_def: str
     storage_key: str
-    original_name: str
     mime_hint: str = ""
     description: str = ""
     source: str = ""
-    labels: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+    usage_count: int = 0
+    last_used_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -55,9 +48,9 @@ class StickerUsageEvent:
 @dataclass(slots=True)
 class InspectItem:
     asset_id: str
-    group_name: str
-    original_name: str
+    meme_def: str
     description: str = ""
+    tags: tuple[str, ...] = ()
     usage_count: int = 0
 
 
@@ -90,6 +83,6 @@ class DeleteResult:
 @dataclass(slots=True)
 class ParsedMarker:
     raw_text: str
-    tags: tuple[str, ...]
+    tokens: tuple[str, ...]
     start: int
     end: int

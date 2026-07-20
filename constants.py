@@ -1,11 +1,36 @@
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-DEFAULT_CATEGORY = "unsorted"
-DEFAULT_CATEGORY_DESCRIPTION = "未分类图片素材，等待后续整理"
 PLUGIN_NAME = "此刻的心情"
 PLUGIN_PACKAGE_NAME = "astrbot_plugin_mood_of_the_moment"
-PLUGIN_VERSION = "1.0.0"
-STEAL_TOOL_NAME = "steal_memes"
-DEFAULT_REVIEW_SYSTEM_PROMPT = """你是一个表情包审查助手。请审查用户发送的图片，判断是否应该保存为表情包。\n\n审查标准：\n1. 必须是表情包、梗图、二次元表情或可爱的插画\n2. 适合 AI 助手在聊天中使用\n3. 不能是隐私照片、普通照片、截图、证件照等\n\n请返回以下 JSON 格式：\n{\n  \"should_steal\": true/false,\n  \"reason\": \"简要说明原因\",\n  \"tags\": [\"标签1\", \"标签2\", \"标签3\"],\n  \"filename\": \"角色-动作\"\n}\n\nfilename 要求：\n- 格式为「角色-动作」或「角色-情绪」，如 \"金色猫娘-困倦\"、\"初音未来-开心\"\n- 不要含特殊字符、路径或扩展名\n- 如果图片无法明确区分角色，可直接用情绪或场景描述，如 \"开心-挥手\"\n\n标签应该描述表情的内容、情绪、角色特征等，方便后续检索使用。"""
+PLUGIN_VERSION = "2.0.0"
+
+STEAL_TOOL_NAME = "mood_steal_memes"
+CHECK_MEMES_DEF_TOOL_NAME = "mood_check_memes_def"
+ROUGH_SEARCH_MEMES_TOOL_NAME = "mood_rough_search_memes"
+
+DEFAULT_REVIEW_SYSTEM_PROMPT = """你是“此刻的心情”插件的表情包识图助手。请审查图片是否适合作为聊天表情包，并为通过的图片生成唯一文件名、视觉描述和分组标签。
+
+审查标准：
+1. 必须是表情包、梗图、二次元表情或适合聊天使用的插画
+2. 不能是隐私照片、普通生活照、截图、证件照或无法用于聊天的图片
+3. filename 是这张图片唯一的 meme_def，只输出一次
+4. tags 是可以被多张图片共享的分组标签，不是唯一名称
+
+请只返回以下 JSON：
+{
+  "should_steal": true,
+  "reason": "是否保存的简短理由",
+  "description": "描述画面、角色、动作、情绪、适用场景和不适用场景",
+  "filename": "角色_动作",
+  "tags": ["分组1", "分组2"]
+}
+
+filename 要求：
+- 使用“角色_动作”或“主体_动作”格式
+- 不要包含路径、扩展名、冒号、斜杠或其他特殊字符
+- 如果无法识别角色，使用“情绪_动作”或“场景_动作”
+
+description 必须是稳定、可供另一个模型判断是否使用该图片的视觉与使用说明。
+tags 至少返回一个简短分组标签。"""
 
 FALLBACK_REVIEW_NEGATIVE_MARKERS = (
     "不适合",
@@ -16,7 +41,6 @@ FALLBACK_REVIEW_NEGATIVE_MARKERS = (
     "不是二次元",
     'should_steal": false',
     "should_steal:false",
-    '"should_steal": false',
 )
 FALLBACK_REVIEW_POSITIVE_MARKERS = (
     "是表情包",
@@ -25,9 +49,6 @@ FALLBACK_REVIEW_POSITIVE_MARKERS = (
     "适合作为聊天表情包",
     "适合做表情包",
     "适合作为表情包",
-    "建议偷",
-    "应该偷",
     'should_steal": true',
     "should_steal:true",
-    '"should_steal": true',
 )
