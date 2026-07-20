@@ -465,6 +465,7 @@ class TestLegacyFormatter(TempDirCase):
         facade.format_busy = False
         facade.dedup = MagicMock()
         facade.dedup.rebuild_index = AsyncMock(return_value=0)
+        facade.dedup.register_file = AsyncMock(return_value=None)
         plugin = MagicMock()
         plugin.paths = paths
         plugin.facade = facade
@@ -589,6 +590,150 @@ class TestLegacyFormatter(TempDirCase):
         self.assertFalse(plugin.facade.format_busy)
         self.assertTrue((plugin.paths.data_dir / "stickers.sqlite3").exists())
         self.assertEqual(run(plugin.facade.storage.count_assets()), 0)
+
+    # ---------- 断点续传 ----------
+
+    def test_resume_continues_from_staging(self):
+        plugin = self._make_plugin()
+        self._make_legacy_db(plugin.paths.data_dir, [
+            {"asset_id": "o1", "storage_key": "a.png", "color": (1, 1, 1)},
+            {"asset_id": "o2", "storage_key": "b.png", "color": (2, 2, 2)},
+            {"asset_id": "o3", "storage_key": "c.png", "color": (3, 3, 3)},
+        ])
+        # 第一轮：识别完第 1 张后取消任务，模拟进程中断
+        calls = {"n": 0}
+        service_holder = {}
+
+        async def slow_review(image_url, reference_context=None):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # 第 2 张识别时直接抛 CancelledError，模拟进程中断
+                raise asyncio.CancelledError()
+            return {
+                "should_steal": True, "reason": "ok",
+                "description": "d", "filename": "第一张", "tags": ["t"],
+            }
+
+        plugin.facade.review.review_image = slow_review
+        service = formatter_mod.LegacyFormatService(plugin)
+        service_holder["svc"] = service
+
+        async def first_round():
+            await service.prepare()
+            if service._task is not None:
+                try:
+                    await service._task
+                except asyncio.CancelledError:
+                    pass
+        run(first_round())
+        # 中断时第 1 张已完成，第 2 张识别前被取消并放回队列
+        self.assertEqual(service.status()["processed"], 1)
+        self.assertEqual(service.status()["status"], "preparing")
+
+        # 构造一个新的 service（模拟重启），修复 review 后 resume
+        service2 = formatter_mod.LegacyFormatService(plugin)
+        plugin.facade.review.review_image = self._review_ok("后续")
+
+        async def do_resume():
+            await service2.resume()
+            if service2._task is not None:
+                await service2._task
+        run(do_resume())
+        status = service2.status()
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["processed"], 3)
+        self.assertEqual(status["succeeded"], 3)
+        # meme_def 不重复
+        defs = {item["meme_def"] for item in status["items"]}
+        self.assertEqual(len(defs), 3)
+
+    def test_prepare_auto_resumes_existing_staging(self):
+        plugin = self._make_plugin()
+        self._make_legacy_db(plugin.paths.data_dir, [
+            {"asset_id": "o1", "storage_key": "a.png"},
+        ])
+        plugin.facade.review.review_image = self._review_ok("名")
+        service = formatter_mod.LegacyFormatService(plugin)
+        self._prepare_and_wait(service)
+        job_id = service.status()["job_id"]
+        # 新 service 直接 prepare，应恢复到同一 job 而不是新建
+        service2 = formatter_mod.LegacyFormatService(plugin)
+        status = run(service2.prepare())
+        self.assertEqual(status["job_id"], job_id)
+        self.assertEqual(status["status"], "ready")
+
+    # ---------- 部分提交 ----------
+
+    def test_partial_commit_then_finalize(self):
+        plugin = self._make_plugin()
+        self._make_legacy_db(plugin.paths.data_dir, [
+            {"asset_id": "o1", "storage_key": "a.png", "color": (1, 1, 1)},
+            {"asset_id": "o2", "storage_key": "b.png", "color": (2, 2, 2)},
+        ])
+        # 第一张识别成功后，第二张识别前取消任务（模拟中断），再部分提交第一张
+        calls = {"n": 0}
+        service_holder = {}
+
+        async def staged_review(image_url, reference_context=None):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                service_holder["svc"]._task.cancel()
+                raise asyncio.CancelledError()
+            return {"should_steal": True, "reason": "ok", "description": "d",
+                    "filename": "第一张", "tags": ["t1"]}
+
+        plugin.facade.review.review_image = staged_review
+        service = formatter_mod.LegacyFormatService(plugin)
+        service_holder["svc"] = service
+
+        async def first_round():
+            await service.prepare()
+            if service._task is not None:
+                try:
+                    await service._task
+                except asyncio.CancelledError:
+                    pass
+        run(first_round())
+        self.assertEqual(service.status()["processed"], 1)
+        job_id = service.status()["job_id"]
+
+        # 部分提交第一张
+        run(service.commit(job_id, confirm=True, discard_failed=True, partial=True))
+        self.assertEqual(run(plugin.facade.storage.count_assets()), 1)
+        self.assertIsNotNone(run(plugin.facade.storage.get_asset_by_meme_def("第一张")))
+        # 旧库此时不应删除（还有未识别项）
+        self.assertTrue((plugin.paths.data_dir / "stickers.sqlite3").exists())
+
+        # 继续识别第二张并最终完成
+        plugin.facade.review.review_image = self._review_ok("第二张")
+        service2 = formatter_mod.LegacyFormatService(plugin)
+
+        async def do_resume():
+            await service2.resume()
+            if service2._task is not None:
+                await service2._task
+        run(do_resume())
+        self.assertEqual(service2.status()["status"], "ready")
+
+        # 部分提交第二张 -> 无剩余 -> 收尾删除旧库
+        run(service2.commit(job_id, confirm=True, discard_failed=True, partial=True))
+        self.assertEqual(run(plugin.facade.storage.count_assets()), 2)
+        self.assertFalse((plugin.paths.data_dir / "stickers.sqlite3").exists())
+        self.assertFalse((plugin.paths.data_dir / "stickers").exists())
+        self.assertFalse((plugin.paths.data_dir / ".meme_format_staging").exists())
+        self.assertFalse(plugin.facade.format_busy)
+
+    def test_partial_commit_no_success_rejected(self):
+        plugin = self._make_plugin()
+        self._make_legacy_db(plugin.paths.data_dir, [
+            {"asset_id": "o1", "storage_key": "missing.png", "file_exists": False},
+        ])
+        plugin.facade.review.review_image = self._review_ok("名")
+        service = formatter_mod.LegacyFormatService(plugin)
+        self._prepare_and_wait(service)
+        job_id = service.status()["job_id"]
+        with self.assertRaises(ValueError):
+            run(service.commit(job_id, confirm=True, discard_failed=True, partial=True))
 
 
 class TestToolNames(TempDirCase):

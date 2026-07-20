@@ -841,3 +841,12 @@ body.is-select-mode .thumb {
   color: #8a5a00;
   font-size: 13px;
 }
+
+.badge.done {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.format-table tr.row-committed td {
+  opacity: 0.55;
+}

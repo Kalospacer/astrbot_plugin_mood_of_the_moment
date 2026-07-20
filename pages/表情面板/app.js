@@ -498,6 +498,7 @@ function closeFormatModal() {
 }
 
 function formatItemStatusBadge(item) {
+  if (item.committed) return `<span class="badge done">已入库</span>`;
   if (item.status === "success") return `<span class="badge ok">成功</span>`;
   return `<span class="badge fail">失败</span>`;
 }
@@ -517,7 +518,7 @@ function renderFormatBody() {
     body.innerHTML = `
       <div class="format-intro">
         <p>此工具使用视觉模型重新识别旧库（stickers.sqlite3）中的所有图片，为每张图片生成新的 <b>meme_def</b>、描述和 tags，并迁移到 v2 新库。</p>
-        <p>运行前提：当前新库必须为空。迁移期间将暂停自动采集、手动导入和自动清理。</p>
+        <p>支持断点续传：识别中途关闭页面或重启后可继续；也可在识别过程中先部分提交已成功项。</p>
         ${note}
         <button id="startFormatBtn" type="button" class="primary">开始格式化旧库</button>
       </div>
@@ -530,7 +531,10 @@ function renderFormatBody() {
     body.innerHTML = `
       <div class="format-intro">
         <p class="format-note fail-text">格式化分析失败：${escapeHtml(job.error || "未知错误")}</p>
-        <button id="cancelFormatBtn" type="button" class="ghost" data-job-id="${escapeHtml(job.job_id || "")}">清理任务</button>
+        <div class="modal-actions" style="padding:0;border:none;">
+          <button id="cancelFormatBtn" type="button" class="ghost" data-job-id="${escapeHtml(job.job_id || "")}">清理任务</button>
+          <button id="resumeFormatBtn" type="button" class="primary">重试识别</button>
+        </div>
       </div>
     `;
     stopFormatPolling();
@@ -541,11 +545,12 @@ function renderFormatBody() {
   const total = job.total || 0;
   const succeeded = job.succeeded || 0;
   const failed = job.failed || 0;
+  const pendingCommit = job.pending_commit || 0;
   const items = job.items || [];
   const progressPct = total ? Math.round((processed / total) * 100) : 0;
 
   const rows = items.map((item) => `
-    <tr>
+    <tr class="${item.committed ? "row-committed" : ""}">
       <td>${formatItemStatusBadge(item)}</td>
       <td><code>${escapeHtml(item.old_storage_key || "")}</code></td>
       <td>${item.meme_def ? `<b>:${escapeHtml(item.meme_def)}:</b>` : "-"}</td>
@@ -554,8 +559,9 @@ function renderFormatBody() {
     </tr>
   `).join("");
 
-  const actionBar = status === "ready"
-    ? `
+  let actionBar = "";
+  if (status === "ready") {
+    actionBar = `
       <div class="format-confirm">
         <p class="format-warning">⚠️ 提交后：仅成功项进入新库；<b>${failed} 个失败项将被永久删除</b>（随旧库一起清除），且不可恢复。</p>
         <div class="modal-actions" style="padding:0;border:none;">
@@ -563,8 +569,19 @@ function renderFormatBody() {
           <button id="commitFormatBtn" type="button" class="primary danger" data-job-id="${escapeHtml(job.job_id)}">确认提交（删除失败项）</button>
         </div>
       </div>
-    `
-    : `<p class="format-note">正在逐张调用视觉模型识图，请稍候……</p>`;
+    `;
+  } else {
+    // preparing：识别进行中，可部分提交或继续
+    actionBar = `
+      <div class="format-confirm">
+        <p class="format-note">正在逐张识图。已识别成功的 <b>${pendingCommit}</b> 项可先部分提交入库，剩余项继续识别。</p>
+        <div class="modal-actions" style="padding:0;border:none;">
+          <button id="cancelFormatBtn" type="button" class="ghost" data-job-id="${escapeHtml(job.job_id)}">取消任务</button>
+          <button id="partialCommitFormatBtn" type="button" class="primary" data-job-id="${escapeHtml(job.job_id)}" ${pendingCommit ? "" : "disabled"}>部分提交已成功的 ${pendingCommit} 项</button>
+        </div>
+      </div>
+    `;
+  }
 
   body.innerHTML = `
     <div class="format-summary">
@@ -572,6 +589,7 @@ function renderFormatBody() {
       <span>已处理 <b>${processed}</b>（${progressPct}%）</span>
       <span class="ok-text">识图成功 <b>${succeeded}</b></span>
       <span class="fail-text">识图失败 <b>${failed}</b></span>
+      <span>待提交 <b>${pendingCommit}</b></span>
     </div>
     <div class="format-progress"><div class="format-progress-bar" style="width:${progressPct}%"></div></div>
     <div class="format-table-wrap">
@@ -620,6 +638,43 @@ async function commitFormatJob(jobId) {
     await reloadAfterMutation("");
   } catch (err) {
     showToast(err.message || "提交失败", "error");
+    await refreshFormatStatus();
+  }
+}
+
+async function partialCommitFormatJob(jobId) {
+  const job = state.formatJob || {};
+  const pending = job.pending_commit || 0;
+  if (!pending) {
+    showToast("暂无可提交的成功项", "error");
+    return;
+  }
+  const ok = await customConfirm(`先把已识别成功的 ${pending} 项提交入库？剩余项将继续识别，旧库在全部完成后才删除。`);
+  if (!ok) return;
+  const btn = $("#partialCommitFormatBtn");
+  if (btn) btn.disabled = true;
+  try {
+    state.formatJob = await fetchJson("/maintenance/format_old_library/commit", {
+      method: "POST",
+      body: { job_id: jobId, confirm: true, discard_failed: true, partial: true },
+    });
+    state.imageCache.clear();
+    showToast(`已部分提交 ${pending} 项入库`);
+    renderFormatBody();
+    await loadOverview();
+  } catch (err) {
+    showToast(err.message || "部分提交失败", "error");
+    await refreshFormatStatus();
+  }
+}
+
+async function resumeFormatJob() {
+  try {
+    state.formatJob = await fetchJson("/maintenance/format_old_library/resume", { method: "POST", body: {} });
+    showToast("已继续识别");
+    renderFormatBody();
+  } catch (err) {
+    showToast(err.message || "无法继续识别", "error");
     await refreshFormatStatus();
   }
 }
@@ -684,6 +739,14 @@ document.addEventListener("click", async (event) => {
   }
   if (target.id === "commitFormatBtn") {
     await commitFormatJob(target.dataset.jobId || "");
+    return;
+  }
+  if (target.id === "partialCommitFormatBtn") {
+    await partialCommitFormatJob(target.dataset.jobId || "");
+    return;
+  }
+  if (target.id === "resumeFormatBtn") {
+    await resumeFormatJob();
     return;
   }
   if (target.id === "cancelFormatBtn") {

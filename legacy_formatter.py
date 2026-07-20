@@ -37,6 +37,10 @@ class LegacyFormatService:
         async with self._lock:
             if self._task and not self._task.done():
                 return self.status()
+            # 断点续传：若已有未完成的 staging job，优先恢复而不是新建。
+            resumed = await self._try_resume_from_staging()
+            if resumed is not None:
+                return resumed
             if await self.plugin.facade.storage.count_assets() > 0:
                 raise ValueError("新库已有资产，不能格式化旧库")
             rows = await asyncio.to_thread(self._read_legacy_rows_sync)
@@ -55,17 +59,82 @@ class LegacyFormatService:
                 "items": [],
                 "created_at": int(time.time()),
                 "staging_dir": str(job_dir),
+                "remaining_rows": rows,
             }
             await self._persist_manifest()
             self.plugin.facade.format_busy = True
-            self._task = asyncio.create_task(self._run_prepare(rows))
+            self._task = asyncio.create_task(self._run_prepare())
             return self.status()
+
+    async def resume(self) -> dict:
+        """显式恢复中断的格式化任务（供 WebUI 调用）。"""
+        async with self._lock:
+            if self._task and not self._task.done():
+                return self.status()
+            resumed = await self._try_resume_from_staging()
+            if resumed is None:
+                raise ValueError("没有可恢复的格式化任务")
+            return resumed
+
+    async def _try_resume_from_staging(self) -> dict | None:
+        """从 staging manifest 恢复未完成的 job 并继续识别剩余项。"""
+        job = await asyncio.to_thread(self._load_staging_manifest)
+        if job is None:
+            return None
+        status = job.get("status")
+        remaining = job.get("remaining_rows") or []
+        # 可恢复：进行中、就绪，或失败/中断但仍有未识别项。
+        if status not in ("preparing", "ready", "failed", "cancelled"):
+            return None
+        if status in ("failed", "cancelled") and not remaining:
+            return None
+        self._job = job
+        self._job.pop("error", None)
+        self.plugin.facade.format_busy = True
+        if remaining:
+            self._job["status"] = "preparing"
+            await self._persist_manifest()
+            self._task = asyncio.create_task(self._run_prepare())
+        else:
+            self._job["status"] = "ready"
+            await self._persist_manifest()
+        return self.status()
+
+    def _load_staging_manifest(self) -> dict | None:
+        if not self.staging_root.is_dir():
+            return None
+        try:
+            job_dirs = sorted(
+                (p for p in self.staging_root.iterdir() if p.is_dir()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return None
+        for job_dir in job_dirs:
+            manifest = job_dir / "manifest.json"
+            if not manifest.is_file():
+                continue
+            try:
+                job = json.loads(manifest.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(job, dict) and job.get("job_id"):
+                job["staging_dir"] = str(job_dir)
+                return job
+        return None
 
     def status(self) -> dict:
         if self._job is None:
             return {"status": "idle"}
         result = dict(self._job)
         result.pop("staging_dir", None)
+        result.pop("remaining_rows", None)
+        result["pending_commit"] = sum(
+            1
+            for item in self._job.get("items", [])
+            if item.get("status") == "success" and not item.get("committed")
+        )
         result["items"] = [
             {
                 key: item.get(key)
@@ -77,13 +146,20 @@ class LegacyFormatService:
                     "description",
                     "status",
                     "reason",
+                    "committed",
                 )
             }
             for item in self._job.get("items", [])
         ]
         return result
 
-    async def commit(self, job_id: str, confirm: bool, discard_failed: bool) -> dict:
+    async def commit(
+        self,
+        job_id: str,
+        confirm: bool,
+        discard_failed: bool,
+        partial: bool = False,
+    ) -> dict:
         if not confirm:
             raise ValueError("格式化旧库提交需要 confirm=true")
         if not discard_failed:
@@ -91,10 +167,31 @@ class LegacyFormatService:
         if self._job is None or self._job.get("job_id") != job_id:
             raise ValueError("格式化任务不存在或已过期")
         if self._task and not self._task.done():
-            raise ValueError("格式化分析尚未完成")
-        if self._job.get("status") != "ready":
-            raise ValueError(f"当前任务不能提交: {self._job.get('status')}")
+            if not partial:
+                raise ValueError("格式化分析尚未完成；如需部分提交请使用 partial=true")
+            # 部分提交：暂停识别，先提交已成功项。
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        status = self._job.get("status")
+        if status not in ("ready", "preparing"):
+            raise ValueError(f"当前任务不能提交: {status}")
+        if not partial and status != "ready":
+            raise ValueError(f"当前任务不能提交: {status}")
 
+        successful_items = [
+            item
+            for item in self._job["items"]
+            if item.get("status") == "success" and not item.get("committed")
+        ]
+        if not successful_items:
+            raise ValueError("没有可提交的识图成功项")
+
+        if partial:
+            return await self._commit_partial(successful_items)
+        return await self._commit_full(successful_items)
+
+    async def _commit_full(self, successful_items: list[dict]) -> dict:
+        """整体提交：建临时新库原子切换，成功后删除旧库与 staging。"""
         job_dir = Path(str(self._job["staging_dir"])).resolve()
         temp_dir = job_dir / "meme_defs"
         temp_db = job_dir / "meme_defs.sqlite3"
@@ -109,29 +206,9 @@ class LegacyFormatService:
 
         temp_storage = StickerStorage(temp_paths)
         await temp_storage.initialize()
-        successful_items = [
-            item
-            for item in self._job["items"]
-            if item.get("status") == "success"
-        ]
         try:
             for item in successful_items:
-                staged_path = job_dir / "assets" / str(item["staged_name"])
-                storage_key, _ = await temp_storage.import_file(
-                    staged_path, str(item["meme_def"])
-                )
-                await temp_storage.add_asset(
-                    StickerAssetDraft(
-                        meme_def=str(item["meme_def"]),
-                        storage_key=storage_key,
-                        mime_hint=staged_path.suffix.lower(),
-                        description=str(item["description"]),
-                        source=str(item.get("source") or "legacy_format"),
-                        tags=tuple(item["tags"]),
-                        usage_count=int(item.get("usage_count") or 0),
-                        last_used_at=item.get("last_used_at"),
-                    )
-                )
+                await self._stage_item_to_storage(temp_storage, job_dir, item)
             if await temp_storage.count_assets() != len(successful_items):
                 raise RuntimeError("临时新库资产数量校验失败")
         except Exception:
@@ -163,7 +240,6 @@ class LegacyFormatService:
         if old_dir.exists():
             shutil.rmtree(old_dir, ignore_errors=True)
         self._remove_tree_with_retry(job_dir)
-        # 清理 staging 根目录（若已为空）
         try:
             self.staging_root.rmdir()
         except OSError:
@@ -171,6 +247,85 @@ class LegacyFormatService:
         self._job["status"] = "committed"
         self.plugin.facade.format_busy = False
         return self.status()
+
+    async def _commit_partial(self, successful_items: list[dict]) -> dict:
+        """部分提交：把已成功项并入当前正式库，标记为已提交，保留剩余项。"""
+        job_dir = Path(str(self._job["staging_dir"])).resolve()
+        storage = self.plugin.facade.storage
+        try:
+            for item in successful_items:
+                staged_path = job_dir / "assets" / str(item["staged_name"])
+                storage_key, _ = await storage.import_file(
+                    staged_path, str(item["meme_def"])
+                )
+                asset = await storage.add_asset(
+                    StickerAssetDraft(
+                        meme_def=str(item["meme_def"]),
+                        storage_key=storage_key,
+                        mime_hint=staged_path.suffix.lower(),
+                        description=str(item["description"]),
+                        source=str(item.get("source") or "legacy_format"),
+                        tags=tuple(item["tags"]),
+                        usage_count=int(item.get("usage_count") or 0),
+                        last_used_at=item.get("last_used_at"),
+                    )
+                )
+                await self.plugin.facade.dedup.register_file(
+                    await storage.resolve_path(asset.storage_key), asset
+                )
+                item["committed"] = True
+                staged_path.unlink(missing_ok=True)
+            await self._persist_manifest()
+        except Exception:
+            logger.error("此刻的心情: 部分提交失败", exc_info=True)
+            raise
+
+        remaining_rows = self._job.get("remaining_rows") or []
+        if remaining_rows:
+            # 还有未识别项：恢复识别（used 集合由 manifest 中未提交+已提交项共同决定）。
+            self._job["status"] = "preparing"
+            await self._persist_manifest()
+            self.plugin.facade.format_busy = True
+            self._task = asyncio.create_task(self._run_prepare())
+        else:
+            # 全部识别完成且无剩余：收尾（删除旧库与 staging）。
+            await self._finalize_after_all_committed()
+        return self.status()
+
+    async def _finalize_after_all_committed(self) -> None:
+        """所有项均已识别且成功项已部分提交后，删除旧库与 staging。"""
+        job_dir = Path(str(self._job["staging_dir"])).resolve()
+        old_db = self.legacy_db.resolve()
+        old_dir = self.legacy_stickers.resolve()
+        if old_db.exists():
+            self._remove_file_with_retry(old_db)
+        if old_dir.exists():
+            shutil.rmtree(old_dir, ignore_errors=True)
+        self._remove_tree_with_retry(job_dir)
+        try:
+            self.staging_root.rmdir()
+        except OSError:
+            pass
+        self._job["status"] = "committed"
+        self.plugin.facade.format_busy = False
+        # staging 已删除，不再持久化 manifest。
+
+    @staticmethod
+    async def _stage_item_to_storage(storage, job_dir: Path, item: dict) -> None:
+        staged_path = job_dir / "assets" / str(item["staged_name"])
+        storage_key, _ = await storage.import_file(staged_path, str(item["meme_def"]))
+        await storage.add_asset(
+            StickerAssetDraft(
+                meme_def=str(item["meme_def"]),
+                storage_key=storage_key,
+                mime_hint=staged_path.suffix.lower(),
+                description=str(item["description"]),
+                source=str(item.get("source") or "legacy_format"),
+                tags=tuple(item["tags"]),
+                usage_count=int(item.get("usage_count") or 0),
+                last_used_at=item.get("last_used_at"),
+            )
+        )
 
     @staticmethod
     def _remove_file_with_retry(path: Path, attempts: int = 5) -> None:
@@ -217,16 +372,28 @@ class LegacyFormatService:
         self.plugin.facade.format_busy = False
         return self.status()
 
-    async def _run_prepare(self, rows: list[dict]) -> None:
+    async def _run_prepare(self) -> None:
         assert self._job is not None
         job_dir = Path(str(self._job["staging_dir"]))
         assets_dir = job_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
-        used_defs: set[str] = set()
-        used_tags: set[str] = set()
+        # 断点续传：used_defs/used_tags 需包含已处理项，避免恢复后 meme_def 重复。
+        used_defs: set[str] = {
+            str(item.get("meme_def") or "").casefold()
+            for item in self._job["items"]
+            if item.get("status") == "success" and item.get("meme_def")
+        }
+        used_tags: set[str] = {
+            str(tag).casefold()
+            for item in self._job["items"]
+            for tag in (item.get("tags") or [])
+        }
+        current_row: dict | None = None
         try:
-            for row in rows:
-                item = await self._format_one(row, assets_dir, used_defs, used_tags)
+            while self._job.get("remaining_rows"):
+                current_row = self._job["remaining_rows"].pop(0)
+                item = await self._format_one(current_row, assets_dir, used_defs, used_tags)
+                current_row = None
                 self._job["items"].append(item)
                 self._job["processed"] += 1
                 if item["status"] == "success":
@@ -236,7 +403,11 @@ class LegacyFormatService:
                 await self._persist_manifest()
             self._job["status"] = "ready"
         except asyncio.CancelledError:
-            self._job["status"] = "cancelled"
+            # 中断时若当前项尚未完成识别，放回待识别队列，避免丢失。
+            if current_row is not None:
+                self._job["remaining_rows"].insert(0, current_row)
+            self._job["status"] = "preparing"  # 保留进度，可再次 resume
+            await self._persist_manifest()
             raise
         except Exception as exc:
             self._job["status"] = "failed"
@@ -273,10 +444,14 @@ class LegacyFormatService:
             reference_lines.append(f"旧描述: {old_description}")
         if old_tags:
             reference_lines.append(f"旧 tags: {', '.join(old_tags)}")
-        review = await self.plugin.facade.review.review_image(
-            str(source_path),
-            reference_context="\n".join(reference_lines),
-        )
+        try:
+            review = await self.plugin.facade.review.review_image(
+                str(source_path),
+                reference_context="\n".join(reference_lines),
+            )
+        except Exception as exc:
+            base["reason"] = f"视觉模型调用失败: {exc}"
+            return base
         if not review.get("should_steal"):
             base["reason"] = str(review.get("reason") or "视觉模型未通过")
             return base

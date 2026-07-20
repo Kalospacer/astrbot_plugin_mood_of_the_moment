@@ -45,6 +45,7 @@ class MoodPageApi:
             ("/dedup/candidates", self.get_duplicate_candidates, ["GET"], "Mood sticker duplicate candidates"),
             ("/dedup/rebuild", self.rebuild_dhash_index, ["POST"], "Mood sticker rebuild dHash index"),
             ("/maintenance/format_old_library/prepare", self.prepare_old_library_format, ["POST"], "Prepare old sticker library format"),
+            ("/maintenance/format_old_library/resume", self.resume_old_library_format, ["POST"], "Resume old sticker library format"),
             ("/maintenance/format_old_library/status", self.get_old_library_format_status, ["GET"], "Old sticker library format status"),
             ("/maintenance/format_old_library/commit", self.commit_old_library_format, ["POST"], "Commit old sticker library format"),
             ("/maintenance/format_old_library/cancel", self.cancel_old_library_format, ["POST"], "Cancel old sticker library format"),
@@ -301,6 +302,12 @@ class MoodPageApi:
         except Exception as exc:
             return self._error(str(exc))
 
+    async def resume_old_library_format(self) -> dict[str, Any]:
+        try:
+            return self._ok(await self.formatter.resume())
+        except Exception as exc:
+            return self._error(str(exc))
+
     async def get_old_library_format_status(self) -> dict[str, Any]:
         return self._ok(self.formatter.status())
 
@@ -311,6 +318,7 @@ class MoodPageApi:
                 job_id=self._single_line(payload.get("job_id"), 100),
                 confirm=bool(payload.get("confirm")),
                 discard_failed=bool(payload.get("discard_failed")),
+                partial=bool(payload.get("partial")),
             )
             return self._ok(result)
         except Exception as exc:
