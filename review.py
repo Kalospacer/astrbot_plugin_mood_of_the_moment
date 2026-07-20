@@ -78,24 +78,13 @@ class ReviewService:
             "tags": [],
         }
 
-    async def review_image(
-        self,
-        image_url: str,
-        reference_context: str | None = None,
-    ) -> dict:
+    async def review_image(self, image_url: str) -> dict:
         provider = self._get_provider()
         if provider is None:
             return self._empty_result("未找到可用的 LLM 提供商，无法审查图片")
         try:
-            prompt = self._get_review_prompt()
-            if reference_context and reference_context.strip():
-                prompt = (
-                    f"{prompt}\n\n以下是这张图片在旧库中的参考信息，仅供参考，"
-                    "不要直接沿用旧 tags 或旧描述，请以你看到的图片内容重新生成：\n"
-                    f"{reference_context.strip()}"
-                )
             response = await provider.text_chat(
-                prompt=prompt, image_urls=[image_url]
+                prompt=self._get_review_prompt(), image_urls=[image_url]
             )
             result_text = str(getattr(response, "completion_text", "") or "").strip()
             if not result_text:

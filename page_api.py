@@ -17,7 +17,14 @@ from .legacy_formatter import LegacyFormatService
 from .models import StickerAsset
 from .utils import normalize_meme_def, normalize_tags, safe_filename
 
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - Pillow 缺失时回退原图
+    Image = None
+
 PAGE_API_PREFIX = f"/{PLUGIN_PACKAGE_NAME}/page"
+THUMBNAIL_MAX_EDGE = 256
+THUMBNAIL_QUALITY = 80
 
 
 class MoodPageApi:
@@ -35,6 +42,7 @@ class MoodPageApi:
             ("/stickers", self.list_stickers, ["GET"], "Mood sticker page list"),
             ("/sticker", self.get_sticker, ["GET"], "Mood sticker page detail"),
             ("/sticker/image", self.get_sticker_image, ["GET"], "Mood sticker image"),
+            ("/sticker/thumbnail", self.get_sticker_thumbnail, ["GET"], "Mood sticker thumbnail"),
             ("/sticker/image_data", self.get_sticker_image_data, ["GET"], "Mood sticker image data"),
             ("/sticker/import", self.import_sticker, ["POST"], "Mood sticker import"),
             ("/sticker/upload", self.upload_sticker, ["POST"], "Mood sticker upload"),
@@ -45,6 +53,7 @@ class MoodPageApi:
             ("/dedup/candidates", self.get_duplicate_candidates, ["GET"], "Mood sticker duplicate candidates"),
             ("/dedup/rebuild", self.rebuild_dhash_index, ["POST"], "Mood sticker rebuild dHash index"),
             ("/maintenance/format_old_library/prepare", self.prepare_old_library_format, ["POST"], "Prepare old sticker library format"),
+            ("/maintenance/format_old_library/plugin_dirs", self.list_format_plugin_dirs, ["GET"], "List sibling plugin dirs for format scan"),
             ("/maintenance/format_old_library/resume", self.resume_old_library_format, ["POST"], "Resume old sticker library format"),
             ("/maintenance/format_old_library/status", self.get_old_library_format_status, ["GET"], "Old sticker library format status"),
             ("/maintenance/format_old_library/commit", self.commit_old_library_format, ["POST"], "Commit old sticker library format"),
@@ -140,8 +149,87 @@ class MoodPageApi:
         if isinstance(resolved, dict):
             return self._error(str(resolved.get("error") or "图片不存在"))
         response = await send_file(resolved)
-        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Cache-Control"] = "public, max-age=3600"
         return response
+
+    async def get_sticker_thumbnail(self):
+        asset_id = self._query("asset_id", 120)
+        asset = await self.plugin.facade.storage.get_asset(asset_id) if asset_id else None
+        if asset is None:
+            return self._error("没有找到这个贴纸")
+        source = await self.plugin.facade.storage.resolve_path(asset.storage_key)
+        if not source.exists():
+            return self._error("图片文件不存在")
+        thumb = await self._get_or_create_thumbnail(asset, source)
+        # 生成失败时回退原图，保证可用。
+        target = thumb if thumb is not None else source
+        response = await send_file(target)
+        response.headers["Cache-Control"] = "public, max-age=86400"
+        return response
+
+    def _thumbnail_dir(self) -> Path:
+        return self.plugin.paths.data_dir / ".thumbnails"
+
+    async def _get_or_create_thumbnail(self, asset: StickerAsset, source: Path) -> Path | None:
+        return await asyncio.to_thread(self._build_thumbnail_sync, asset, source)
+
+    def _build_thumbnail_sync(self, asset: StickerAsset, source: Path) -> Path | None:
+        if Image is None:
+            return None
+        thumb_dir = self._thumbnail_dir()
+        thumb_path = thumb_dir / f"{asset.asset_id}.webp"
+        try:
+            if thumb_path.exists() and thumb_path.stat().st_mtime >= source.stat().st_mtime:
+                return thumb_path
+        except OSError:
+            pass
+        try:
+            thumb_dir.mkdir(parents=True, exist_ok=True)
+            with Image.open(source) as img:
+                img = img.convert("RGB")
+                img.thumbnail((THUMBNAIL_MAX_EDGE, THUMBNAIL_MAX_EDGE), Image.LANCZOS)
+                img.save(thumb_path, "WEBP", quality=THUMBNAIL_QUALITY)
+            return thumb_path
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME}: 生成缩略图失败 {asset.asset_id}: {exc}")
+            return None
+
+    def delete_thumbnail(self, asset_id: str) -> None:
+        try:
+            (self._thumbnail_dir() / f"{asset_id}.webp").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    async def prune_orphan_thumbnails(self) -> int:
+        """清理没有对应资产的孤兒缩略图，返回清理数量。"""
+        return await asyncio.to_thread(self._prune_orphan_thumbnails_sync)
+
+    def _prune_orphan_thumbnails_sync(self) -> int:
+        thumb_dir = self._thumbnail_dir()
+        if not thumb_dir.is_dir():
+            return 0
+        valid_ids = set()
+        # 同步查库（仅在启动时调用一次）。
+        import sqlite3 as _sqlite3
+        db = self.plugin.paths.metadata_db
+        if db.is_file():
+            try:
+                with _sqlite3.connect(str(db)) as conn:
+                    valid_ids = {
+                        str(row[0])
+                        for row in conn.execute("SELECT asset_id FROM sticker_assets")
+                    }
+            except Exception:
+                return 0
+        removed = 0
+        for path in thumb_dir.glob("*.webp"):
+            if path.stem not in valid_ids:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
 
     async def get_sticker_image_data(self) -> dict[str, Any]:
         resolved = await self._resolve_asset_image_path()
@@ -297,8 +385,17 @@ class MoodPageApi:
         return self._ok({"indexed": await self.plugin.facade.dedup.rebuild_index()})
 
     async def prepare_old_library_format(self) -> dict[str, Any]:
+        payload = await request.get_json(silent=True) or {}
+        source = self._single_line(payload.get("source"), 32) or "legacy"
+        plugin_dir = self._single_line(payload.get("plugin_dir"), 200) or None
         try:
-            return self._ok(await self.formatter.prepare())
+            return self._ok(await self.formatter.prepare(source=source, plugin_dir_name=plugin_dir))
+        except Exception as exc:
+            return self._error(str(exc))
+
+    async def list_format_plugin_dirs(self) -> dict[str, Any]:
+        try:
+            return self._ok({"items": self.formatter.list_sibling_plugin_dirs()})
         except Exception as exc:
             return self._error(str(exc))
 
@@ -408,7 +505,8 @@ class MoodPageApi:
             "last_used_at": int(asset.last_used_at or 0),
             "tags": list(asset.tags),
             "exists": resolved.exists() and resolved.is_file(),
-            "image_endpoint": f"/sticker/image_data?asset_id={quote(asset.asset_id, safe='')}",
+            "image_endpoint": f"/sticker/image?asset_id={quote(asset.asset_id, safe='')}",
+            "thumbnail_endpoint": f"/sticker/thumbnail?asset_id={quote(asset.asset_id, safe='')}",
         }
         if include_path:
             payload["file_path"] = asset.storage_key

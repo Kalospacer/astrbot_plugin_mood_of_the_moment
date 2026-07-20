@@ -103,6 +103,40 @@ class PluginFacade:
                 f"此刻的心情: 启动时清理失效资产 {len(stale_asset_ids)} 个"
             )
         await self.dedup.initialize()
+        await self._prune_orphan_thumbnails()
+
+    async def _prune_orphan_thumbnails(self) -> None:
+        """清理无对应资产的孤兒缩略图。"""
+        thumb_dir = self.paths.data_dir / ".thumbnails"
+        if not thumb_dir.is_dir():
+            return
+
+        def _clean() -> int:
+            removed = 0
+            valid_ids = set()
+            import sqlite3 as _sqlite3
+
+            if self.paths.metadata_db.is_file():
+                try:
+                    with _sqlite3.connect(str(self.paths.metadata_db)) as conn:
+                        valid_ids = {
+                            str(row[0])
+                            for row in conn.execute("SELECT asset_id FROM sticker_assets")
+                        }
+                except Exception:
+                    valid_ids = set()
+            for path in thumb_dir.glob("*.webp"):
+                if path.stem not in valid_ids:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+            return removed
+
+        removed_count = await asyncio.to_thread(_clean)
+        if removed_count:
+            logger.info(f"此刻的心情: 启动时清理孤兒缩略图 {removed_count} 个")
 
     async def shutdown(self) -> None:
         await self.storage.close()
@@ -472,6 +506,11 @@ class PluginFacade:
             return DeleteResult(ok=False, message=f"未找到 asset_id={asset_id} 的图片资产。")
         await self.storage.delete_file(asset.storage_key)
         await self.dedup.unregister_asset(asset)
+        # 同步清理缩略图缓存。
+        try:
+            (self.paths.data_dir / ".thumbnails" / f"{asset_id}.webp").unlink(missing_ok=True)
+        except OSError:
+            pass
         return DeleteResult(ok=True, message=f"已删除图片资产: {asset.meme_def}", asset=asset)
 
     async def check_meme_def(self, meme_def: str) -> dict | None:

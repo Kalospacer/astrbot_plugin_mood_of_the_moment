@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import sqlite3
 import time
@@ -12,6 +11,7 @@ from uuid import uuid4
 
 from astrbot.api import logger
 
+from .constants import SUPPORTED_IMAGE_SUFFIXES
 from .models import PluginPaths, StickerAssetDraft
 from .utils import is_path_within_roots, normalize_meme_def, normalize_tags, safe_filename
 
@@ -33,7 +33,11 @@ class LegacyFormatService:
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
-    async def prepare(self) -> dict:
+    async def prepare(
+        self,
+        source: str = "legacy",
+        plugin_dir_name: str | None = None,
+    ) -> dict:
         async with self._lock:
             if self._task and not self._task.done():
                 return self.status()
@@ -41,17 +45,29 @@ class LegacyFormatService:
             resumed = await self._try_resume_from_staging()
             if resumed is not None:
                 return resumed
-            if await self.plugin.facade.storage.count_assets() > 0:
-                raise ValueError("新库已有资产，不能格式化旧库")
-            rows = await asyncio.to_thread(self._read_legacy_rows_sync)
-            if not rows:
-                raise ValueError("没有找到可格式化的旧库资产")
+            if source == "plugin_scan":
+                target_dir = self._resolve_sibling_plugin_dir(plugin_dir_name)
+                if target_dir is None:
+                    raise ValueError(f"无效的插件目录: {plugin_dir_name or '(未指定)'}")
+                rows = await asyncio.to_thread(
+                    self._scan_plugin_images_sync, target_dir
+                )
+                if not rows:
+                    raise ValueError(f"插件目录 {target_dir.name} 下没有找到图片文件")
+            else:
+                source = "legacy"
+                target_dir = None
+                rows = await asyncio.to_thread(self._read_legacy_rows_sync)
+                if not rows:
+                    raise ValueError("没有找到可格式化的旧库资产")
             job_id = uuid4().hex
             job_dir = self.staging_root / job_id
             job_dir.mkdir(parents=True, exist_ok=True)
             self._job = {
                 "job_id": job_id,
                 "status": "preparing",
+                "source": source,
+                "plugin_dir": target_dir.name if target_dir else "",
                 "total": len(rows),
                 "processed": 0,
                 "succeeded": 0,
@@ -65,6 +81,79 @@ class LegacyFormatService:
             self.plugin.facade.format_busy = True
             self._task = asyncio.create_task(self._run_prepare())
             return self.status()
+
+    def list_sibling_plugin_dirs(self) -> list[dict]:
+        """列出 plugin_data 下其他插件目录及其递归图片数量（供 WebUI 选择）。"""
+        return self._list_sibling_plugin_dirs_sync()
+
+    def _list_sibling_plugin_dirs_sync(self) -> list[dict]:
+        root = self.data_dir.parent.resolve()
+        if not root.is_dir():
+            return []
+        result: list[dict] = []
+        try:
+            children = sorted(
+                (p for p in root.iterdir() if p.is_dir()),
+                key=lambda p: p.name.casefold(),
+            )
+        except OSError:
+            return []
+        own = self.data_dir.resolve().name
+        for child in children:
+            if child.name == own:
+                continue
+            count = len(self._scan_plugin_images_sync(child))
+            if count:
+                result.append(
+                    {"name": child.name, "path": str(child), "image_count": count}
+                )
+        return result
+
+    def _resolve_sibling_plugin_dir(self, plugin_dir_name: str | None) -> Path | None:
+        """校验并解析兄弟插件目录名，防路径穿越。返回 None 表示非法。"""
+        name = str(plugin_dir_name or "").strip()
+        if not name or name in {".", ".."}:
+            return None
+        if "/" in name or "\\" in name:
+            return None
+        root = self.data_dir.parent.resolve()
+        candidate = (root / name).resolve()
+        if candidate == self.data_dir.resolve():
+            return None  # 排除本插件目录
+        if not is_path_within_roots(candidate, (root,)):
+            return None
+        return candidate if candidate.is_dir() else None
+
+    def _scan_plugin_images_sync(self, plugin_dir: Path) -> list[dict]:
+        """递归扫描插件目录下的图片文件，伪造成统一 row。"""
+        rows: list[dict] = []
+        try:
+            files = sorted(plugin_dir.rglob("*"))
+        except OSError:
+            return rows
+        for path in files:
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+                continue
+            try:
+                resolved = path.resolve()
+                stat = resolved.stat()
+            except OSError:
+                continue
+            rows.append(
+                {
+                    "asset_id": f"scan-{uuid4().hex[:12]}",
+                    "storage_key": str(resolved),
+                    "description": "",
+                    "source": f"scan_plugin:{plugin_dir.name}",
+                    "created_at": stat.st_mtime,
+                    "usage_count": 0,
+                    "last_used_at": None,
+                    "old_tags": (),
+                }
+            )
+        return rows
 
     async def resume(self) -> dict:
         """显式恢复中断的格式化任务（供 WebUI 调用）。"""
@@ -191,91 +280,43 @@ class LegacyFormatService:
         return await self._commit_full(successful_items)
 
     async def _commit_full(self, successful_items: list[dict]) -> dict:
-        """整体提交：建临时新库原子切换，成功后删除旧库与 staging。"""
-        job_dir = Path(str(self._job["staging_dir"])).resolve()
-        temp_dir = job_dir / "meme_defs"
-        temp_db = job_dir / "meme_defs.sqlite3"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_paths = PluginPaths(
-            plugin_dir=self.plugin.paths.plugin_dir,
-            data_dir=job_dir,
-            stickers_dir=temp_dir,
-            metadata_db=temp_db,
-        )
-        from .storage import StickerStorage
-
-        temp_storage = StickerStorage(temp_paths)
-        await temp_storage.initialize()
-        try:
-            for item in successful_items:
-                await self._stage_item_to_storage(temp_storage, job_dir, item)
-            if await temp_storage.count_assets() != len(successful_items):
-                raise RuntimeError("临时新库资产数量校验失败")
-        except Exception:
-            await temp_storage.close()
-            raise
-        await temp_storage.close()
-
-        final_db = self.plugin.paths.metadata_db.resolve()
-        final_dir = self.plugin.paths.stickers_dir.resolve()
-        old_db = self.legacy_db.resolve()
-        old_dir = self.legacy_stickers.resolve()
-        if final_db == old_db or final_dir == old_dir:
-            raise RuntimeError("新旧数据路径重叠，拒绝执行破坏性格式化")
-
-        try:
-            if final_dir.exists():
-                shutil.rmtree(final_dir)
-            final_dir.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(str(temp_db), str(final_db))
-            shutil.move(str(temp_dir), str(final_dir))
-            await self.plugin.facade.storage.initialize()
-            await self.plugin.facade.dedup.rebuild_index()
-        except Exception:
-            logger.error("此刻的心情: 切换格式化后的新库失败", exc_info=True)
-            raise
-
-        if old_db.exists():
-            self._remove_file_with_retry(old_db)
-        if old_dir.exists():
-            shutil.rmtree(old_dir, ignore_errors=True)
-        self._remove_tree_with_retry(job_dir)
-        try:
-            self.staging_root.rmdir()
-        except OSError:
-            pass
-        self._job["status"] = "committed"
-        self.plugin.facade.format_busy = False
+        """整体提交：把所有成功项合并进正式库，随后按来源收尾。"""
+        await self._merge_items_into_storage(successful_items)
+        await self._finalize_after_all_committed()
         return self.status()
+
+    async def _merge_items_into_storage(self, successful_items: list[dict]) -> None:
+        """把成功项逐张并入正式库并标记 committed（合并语义，不清空现有库）。"""
+        job_dir = Path(str(self._job["staging_dir"])).resolve()
+        storage = self.plugin.facade.storage
+        for item in successful_items:
+            staged_path = job_dir / "assets" / str(item["staged_name"])
+            storage_key, _ = await storage.import_file(
+                staged_path, str(item["meme_def"])
+            )
+            asset = await storage.add_asset(
+                StickerAssetDraft(
+                    meme_def=str(item["meme_def"]),
+                    storage_key=storage_key,
+                    mime_hint=staged_path.suffix.lower(),
+                    description=str(item["description"]),
+                    source=str(item.get("source") or "legacy_format"),
+                    tags=tuple(item["tags"]),
+                    usage_count=int(item.get("usage_count") or 0),
+                    last_used_at=item.get("last_used_at"),
+                )
+            )
+            await self.plugin.facade.dedup.register_file(
+                await storage.resolve_path(asset.storage_key), asset
+            )
+            item["committed"] = True
+            staged_path.unlink(missing_ok=True)
+        await self._persist_manifest()
 
     async def _commit_partial(self, successful_items: list[dict]) -> dict:
         """部分提交：把已成功项并入当前正式库，标记为已提交，保留剩余项。"""
-        job_dir = Path(str(self._job["staging_dir"])).resolve()
-        storage = self.plugin.facade.storage
         try:
-            for item in successful_items:
-                staged_path = job_dir / "assets" / str(item["staged_name"])
-                storage_key, _ = await storage.import_file(
-                    staged_path, str(item["meme_def"])
-                )
-                asset = await storage.add_asset(
-                    StickerAssetDraft(
-                        meme_def=str(item["meme_def"]),
-                        storage_key=storage_key,
-                        mime_hint=staged_path.suffix.lower(),
-                        description=str(item["description"]),
-                        source=str(item.get("source") or "legacy_format"),
-                        tags=tuple(item["tags"]),
-                        usage_count=int(item.get("usage_count") or 0),
-                        last_used_at=item.get("last_used_at"),
-                    )
-                )
-                await self.plugin.facade.dedup.register_file(
-                    await storage.resolve_path(asset.storage_key), asset
-                )
-                item["committed"] = True
-                staged_path.unlink(missing_ok=True)
-            await self._persist_manifest()
+            await self._merge_items_into_storage(successful_items)
         except Exception:
             logger.error("此刻的心情: 部分提交失败", exc_info=True)
             raise
@@ -288,19 +329,20 @@ class LegacyFormatService:
             self.plugin.facade.format_busy = True
             self._task = asyncio.create_task(self._run_prepare())
         else:
-            # 全部识别完成且无剩余：收尾（删除旧库与 staging）。
+            # 全部识别完成且无剩余：按来源收尾。
             await self._finalize_after_all_committed()
         return self.status()
 
     async def _finalize_after_all_committed(self) -> None:
-        """所有项均已识别且成功项已部分提交后，删除旧库与 staging。"""
+        """合并完成后的收尾：legacy 删除旧库，plugin_scan 保留源文件，仅清 staging。"""
         job_dir = Path(str(self._job["staging_dir"])).resolve()
-        old_db = self.legacy_db.resolve()
-        old_dir = self.legacy_stickers.resolve()
-        if old_db.exists():
-            self._remove_file_with_retry(old_db)
-        if old_dir.exists():
-            shutil.rmtree(old_dir, ignore_errors=True)
+        if self._job.get("source") != "plugin_scan":
+            old_db = self.legacy_db.resolve()
+            old_dir = self.legacy_stickers.resolve()
+            if old_db.exists():
+                self._remove_file_with_retry(old_db)
+            if old_dir.exists():
+                shutil.rmtree(old_dir, ignore_errors=True)
         self._remove_tree_with_retry(job_dir)
         try:
             self.staging_root.rmdir()
@@ -309,23 +351,6 @@ class LegacyFormatService:
         self._job["status"] = "committed"
         self.plugin.facade.format_busy = False
         # staging 已删除，不再持久化 manifest。
-
-    @staticmethod
-    async def _stage_item_to_storage(storage, job_dir: Path, item: dict) -> None:
-        staged_path = job_dir / "assets" / str(item["staged_name"])
-        storage_key, _ = await storage.import_file(staged_path, str(item["meme_def"]))
-        await storage.add_asset(
-            StickerAssetDraft(
-                meme_def=str(item["meme_def"]),
-                storage_key=storage_key,
-                mime_hint=staged_path.suffix.lower(),
-                description=str(item["description"]),
-                source=str(item.get("source") or "legacy_format"),
-                tags=tuple(item["tags"]),
-                usage_count=int(item.get("usage_count") or 0),
-                last_used_at=item.get("last_used_at"),
-            )
-        )
 
     @staticmethod
     def _remove_file_with_retry(path: Path, attempts: int = 5) -> None:
@@ -435,20 +460,21 @@ class LegacyFormatService:
             "reason": "",
         }
         if source_path is None or not source_path.is_file():
-            base["reason"] = "旧图片文件不存在或路径不在旧库目录内"
+            base["reason"] = "图片文件不存在或路径不在允许目录内"
             return base
-        reference_lines: list[str] = []
-        old_description = str(row.get("description") or "").strip()
-        old_tags = tuple(row.get("old_tags") or ())
-        if old_description:
-            reference_lines.append(f"旧描述: {old_description}")
-        if old_tags:
-            reference_lines.append(f"旧 tags: {', '.join(old_tags)}")
+        # 识图前 dHash 去重：与库中已有图片相似则跳过。
         try:
-            review = await self.plugin.facade.review.review_image(
-                str(source_path),
-                reference_context="\n".join(reference_lines),
+            duplicate = await self.plugin.facade.dedup.find_similar_duplicate(
+                source_path
             )
+        except Exception:
+            duplicate = None
+        if duplicate is not None:
+            base["status"] = "duplicate"
+            base["reason"] = f"与现有 {duplicate.meme_def} 重复"
+            return base
+        try:
+            review = await self.plugin.facade.review.review_image(str(source_path))
         except Exception as exc:
             base["reason"] = f"视觉模型调用失败: {exc}"
             return base
@@ -498,7 +524,9 @@ class LegacyFormatService:
         if not candidate.is_absolute():
             candidate = self.legacy_stickers / candidate
         candidate = candidate.resolve()
-        if not is_path_within_roots(candidate, (self.legacy_stickers, self.data_dir)):
+        # 允许旧库目录、本插件 data_dir，以及 plugin_data 根（扫描其他插件来源）。
+        roots = (self.legacy_stickers, self.data_dir, self.data_dir.parent)
+        if not is_path_within_roots(candidate, roots):
             return None
         return candidate
 

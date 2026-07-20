@@ -18,7 +18,6 @@ const state = {
     pageSize: 48,
     total: 0,
   },
-  imageCache: new Map(),
   config: null,
   providers: [],
   formatJob: null,
@@ -232,7 +231,7 @@ function renderStickerWall() {
     <article class="sticker ${state.selectedIds.has(asset.asset_id) ? "is-selected" : ""} ${asset.exists ? "" : "missing"}" data-asset-id="${escapeHtml(asset.asset_id)}">
       <input class="sticker-select" type="checkbox" data-select-asset="${escapeHtml(asset.asset_id)}" ${state.selectedIds.has(asset.asset_id) ? "checked" : ""} aria-label="选择" />
       <div class="thumb" data-open-asset="${escapeHtml(asset.asset_id)}">
-        ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-image-asset="${escapeHtml(asset.asset_id)}" />` : `<span class="missing-text">文件缺失</span>`}
+        ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" loading="lazy" data-thumb-src="${escapeHtml(asset.thumbnail_endpoint || "")}" />` : `<span class="missing-text">文件缺失</span>`}
       </div>
       <div class="sticker-meta">
         <b title="${escapeHtml(asset.meme_def)}">:${escapeHtml(asset.meme_def)}:</b>
@@ -254,28 +253,14 @@ function renderSelectionBar() {
   }
 }
 
-async function hydrateImages(root = document) {
-  const imgs = [...root.querySelectorAll("img[data-image-asset]")];
-  await Promise.all(imgs.map(async (img) => {
-    const assetId = img.dataset.imageAsset;
-    if (!assetId) return;
-    if (state.imageCache.has(assetId)) {
-      img.src = state.imageCache.get(assetId);
-      return;
-    }
-    const asset = state.stickers.find((item) => item.asset_id === assetId) || state.selectedAsset;
-    const endpoint = asset?.image_endpoint;
-    if (!endpoint) return;
-    try {
-      const result = await fetchJson(endpoint);
-      if (result?.data_url) {
-        state.imageCache.set(assetId, result.data_url);
-        img.src = result.data_url;
-      }
-    } catch (error) {
-      img.alt = "图片加载失败";
-    }
-  }));
+function hydrateImages(root = document) {
+  // 列表缩略图与详情原图都直接赋 endpoint，浏览器原生 HTTP 缓存，无需 base64。
+  root.querySelectorAll("img[data-thumb-src]").forEach((img) => {
+    if (!img.src && img.dataset.thumbSrc) img.src = img.dataset.thumbSrc;
+  });
+  root.querySelectorAll("img[data-image-src]").forEach((img) => {
+    if (!img.src && img.dataset.imageSrc) img.src = img.dataset.imageSrc;
+  });
 }
 
 function renderDetailDrawer() {
@@ -288,7 +273,7 @@ function renderDetailDrawer() {
   }
   panel.innerHTML = `
     <div class="detail-image">
-      ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-image-asset="${escapeHtml(asset.asset_id)}" />` : `<span class="missing-text">文件缺失</span>`}
+      ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-image-src="${escapeHtml(asset.image_endpoint || "")}" />` : `<span class="missing-text">文件缺失</span>`}
     </div>
     <form id="detailForm" class="detail-form">
       <label><span>meme_def（唯一名称）</span><input name="meme_def" value="${escapeHtml(asset.meme_def)}" required /></label>
@@ -500,6 +485,7 @@ function closeFormatModal() {
 function formatItemStatusBadge(item) {
   if (item.committed) return `<span class="badge done">已入库</span>`;
   if (item.status === "success") return `<span class="badge ok">成功</span>`;
+  if (item.status === "duplicate") return `<span class="badge dup">重复</span>`;
   return `<span class="badge fail">失败</span>`;
 }
 
@@ -511,19 +497,45 @@ function renderFormatBody() {
 
   if (status === "idle" || status === "committed" || status === "cancelled") {
     const note = status === "committed"
-      ? `<p class="format-note ok-text">上一次格式化已提交完成。</p>`
+      ? `<p class="format-note ok-text">上一次任务已提交完成。</p>`
       : status === "cancelled"
-        ? `<p class="format-note">上一次格式化已取消。</p>`
+        ? `<p class="format-note">上一次任务已取消。</p>`
         : "";
     body.innerHTML = `
       <div class="format-intro">
-        <p>此工具使用视觉模型重新识别旧库（stickers.sqlite3）中的所有图片，为每张图片生成新的 <b>meme_def</b>、描述和 tags，并迁移到 v2 新库。</p>
-        <p>支持断点续传：识别中途关闭页面或重启后可继续；也可在识别过程中先部分提交已成功项。</p>
+        <p>使用视觉模型重新识别图片，为每张图生成新的 <b>meme_def</b>、描述和 tags 并合并入库。支持断点续传与识别中部分提交。</p>
         ${note}
-        <button id="startFormatBtn" type="button" class="primary">开始格式化旧库</button>
+        <div class="format-source">
+          <div class="gtitle">选择图片来源</div>
+          <label class="source-option">
+            <input type="radio" name="format_source" value="legacy" checked />
+            <span><b>本插件旧库</b><small>迁移 stickers.sqlite3 中的旧表情包，成功后删除旧库</small></span>
+          </label>
+          <label class="source-option">
+            <input type="radio" name="format_source" value="plugin_scan" />
+            <span><b>其他插件目录</b><small>扫描 data/plugin_data 下其他插件的图片并导入，源图保留</small></span>
+          </label>
+          <div id="pluginDirPicker" class="plugin-dir-picker" hidden>
+            <div class="gtitle" style="margin-top:8px">选择插件目录</div>
+            <div id="pluginDirList" class="plugin-dir-list"><div class="empty">加载中...</div></div>
+          </div>
+        </div>
+        <button id="startFormatBtn" type="button" class="primary">开始</button>
       </div>
     `;
     stopFormatPolling();
+    // 绑定来源切换
+    $$('input[name="format_source"]', body).forEach((radio) => {
+      radio.addEventListener("change", async (e) => {
+        const picker = $("#pluginDirPicker");
+        if (e.target.value === "plugin_scan") {
+          picker.hidden = false;
+          await loadPluginDirs();
+        } else {
+          picker.hidden = true;
+        }
+      });
+    });
     return;
   }
 
@@ -560,13 +572,18 @@ function renderFormatBody() {
   `).join("");
 
   let actionBar = "";
+  const isScan = job.source === "plugin_scan";
   if (status === "ready") {
+    const confirmText = isScan
+      ? `确认导入？仅成功项合并入库，源图片保留不动。`
+      : `⚠️ 提交后：仅成功项进入新库；<b>${failed} 个失败项将被永久删除</b>（随旧库一起清除），且不可恢复。`;
+    const confirmBtn = isScan ? "确认导入成功项" : "确认提交（删除失败项）";
     actionBar = `
       <div class="format-confirm">
-        <p class="format-warning">⚠️ 提交后：仅成功项进入新库；<b>${failed} 个失败项将被永久删除</b>（随旧库一起清除），且不可恢复。</p>
+        <p class="${isScan ? "format-note" : "format-warning"}">${confirmText}</p>
         <div class="modal-actions" style="padding:0;border:none;">
           <button id="cancelFormatBtn" type="button" class="ghost" data-job-id="${escapeHtml(job.job_id)}">取消任务</button>
-          <button id="commitFormatBtn" type="button" class="primary danger" data-job-id="${escapeHtml(job.job_id)}">确认提交（删除失败项）</button>
+          <button id="commitFormatBtn" type="button" class="primary ${isScan ? "" : "danger"}" data-job-id="${escapeHtml(job.job_id)}" data-source="${escapeHtml(job.source || "legacy")}">${confirmBtn}</button>
         </div>
       </div>
     `;
@@ -610,12 +627,47 @@ function renderFormatBody() {
   }
 }
 
-async function startFormatJob() {
+async function loadPluginDirs() {
+  const list = $("#pluginDirList");
+  if (!list) return;
+  list.innerHTML = `<div class="empty">加载中...</div>`;
   try {
-    state.formatJob = await fetchJson("/maintenance/format_old_library/prepare", { method: "POST", body: {} });
+    const result = await fetchJson("/maintenance/format_old_library/plugin_dirs");
+    const items = result.items || [];
+    if (!items.length) {
+      list.innerHTML = `<div class="empty">data/plugin_data 下没有找到含图片的其他插件目录</div>`;
+      return;
+    }
+    list.innerHTML = items.map((d, i) => `
+      <label class="plugin-dir-item">
+        <input type="radio" name="plugin_dir" value="${escapeHtml(d.name)}" ${i === 0 ? "checked" : ""} />
+        <span class="dir-name">${escapeHtml(d.name)}</span>
+        <span class="dir-count">${escapeHtml(d.image_count)} 张图片</span>
+      </label>
+    `).join("");
+  } catch (err) {
+    list.innerHTML = `<div class="empty">${escapeHtml(err.message || "加载失败")}</div>`;
+  }
+}
+
+async function startFormatJob() {
+  const source = (document.querySelector('input[name="format_source"]:checked') || {}).value || "legacy";
+  let pluginDir = null;
+  if (source === "plugin_scan") {
+    pluginDir = (document.querySelector('input[name="plugin_dir"]:checked') || {}).value;
+    if (!pluginDir) {
+      showToast("请先选择一个插件目录", "error");
+      return;
+    }
+  }
+  try {
+    state.formatJob = await fetchJson("/maintenance/format_old_library/prepare", {
+      method: "POST",
+      body: { source, plugin_dir: pluginDir },
+    });
     renderFormatBody();
   } catch (err) {
-    showToast(err.message || "无法启动格式化", "error");
+    showToast(err.message || "无法启动", "error");
     await refreshFormatStatus();
   }
 }
@@ -623,7 +675,12 @@ async function startFormatJob() {
 async function commitFormatJob(jobId) {
   const job = state.formatJob || {};
   const failed = job.failed || 0;
-  const ok = await customConfirm(`确认提交格式化结果？成功项进入新库，${failed} 个失败项将随旧库被永久删除！`);
+  const isScan = job.source === "plugin_scan";
+  const ok = await customConfirm(
+    isScan
+      ? "确认导入识图成功的图片？成功项将合并入库，源图片保留不动。"
+      : `确认提交格式化结果？成功项进入新库，${failed} 个失败项将随旧库被永久删除！`
+  );
   if (!ok) return;
   const btn = $("#commitFormatBtn");
   if (btn) btn.disabled = true;
@@ -632,8 +689,7 @@ async function commitFormatJob(jobId) {
       method: "POST",
       body: { job_id: jobId, confirm: true, discard_failed: true },
     });
-    state.imageCache.clear();
-    showToast("格式化已提交，旧库已清除");
+    showToast(isScan ? "已导入成功项" : "格式化已提交，旧库已清除");
     closeFormatModal();
     await reloadAfterMutation("");
   } catch (err) {
@@ -658,7 +714,6 @@ async function partialCommitFormatJob(jobId) {
       method: "POST",
       body: { job_id: jobId, confirm: true, discard_failed: true, partial: true },
     });
-    state.imageCache.clear();
     showToast(`已部分提交 ${pending} 项入库`);
     renderFormatBody();
     await loadOverview();
@@ -822,7 +877,6 @@ document.addEventListener("click", async (event) => {
         method: "POST",
         body: { asset_id: state.selectedAssetId, confirm: true },
       });
-      state.imageCache.delete(state.selectedAssetId);
       state.selectedIds.delete(state.selectedAssetId);
       state.selectedAssetId = "";
       state.selectedAsset = null;
@@ -843,7 +897,6 @@ document.addEventListener("click", async (event) => {
         method: "POST",
         body: { asset_ids: assetIds, confirm: true },
       });
-      assetIds.forEach((assetId) => state.imageCache.delete(assetId));
       toggleSelectMode(false);
       await reloadAfterMutation("已批量删除");
     } catch (err) {
@@ -1018,7 +1071,6 @@ document.addEventListener("submit", async (event) => {
       },
     });
     state.selectedAsset = result;
-    state.imageCache.delete(state.selectedAssetId);
     await reloadAfterMutation("修改已保存");
   } catch (err) {
     showToast(err.message || "保存失败", "error");

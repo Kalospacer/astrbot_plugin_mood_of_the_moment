@@ -57,6 +57,16 @@ def _install_astrbot_stub() -> None:
     sys.modules["astrbot.api.event"] = event_mod
     sys.modules["astrbot.api.message_components"] = mc_mod
 
+    # quart stub：page_api 仅 import request/send_file，测试不触发实际调用。
+    quart = types.ModuleType("quart")
+    quart.request = MagicMock(name="quart.request")
+
+    async def _send_file(path, *a, **k):
+        return MagicMock(headers={}, path=str(path))
+
+    quart.send_file = _send_file
+    sys.modules["quart"] = quart
+
 
 _install_astrbot_stub()
 
@@ -397,8 +407,9 @@ class TestReview(TempDirCase):
         result = run(service.review_image("http://x/y.png"))
         self.assertFalse(result["should_steal"])
 
-    def test_reference_context_appended(self):
-        service = ReviewService(context=None, plugin_config={"review_system_prompt": "BASE"})
+    def test_review_uses_plain_prompt(self):
+        # v2：不再拼接任何 reference_context，prompt 即配置或默认。
+        service = ReviewService(context=None, plugin_config={"review_system_prompt": "BASE_PROMPT"})
         response = MagicMock()
         response.completion_text = json.dumps({
             "should_steal": True, "description": "d", "filename": "f", "tags": ["t"],
@@ -406,10 +417,9 @@ class TestReview(TempDirCase):
         provider = MagicMock()
         provider.text_chat = AsyncMock(return_value=response)
         service._get_provider = lambda: provider
-        run(service.review_image("http://x", reference_context="旧 tags: 开心"))
+        run(service.review_image("http://x"))
         prompt_used = provider.text_chat.call_args.kwargs["prompt"]
-        self.assertIn("BASE", prompt_used)
-        self.assertIn("旧 tags: 开心", prompt_used)
+        self.assertEqual(prompt_used, "BASE_PROMPT")
 
 
 class TestLegacyFormatter(TempDirCase):
@@ -466,6 +476,7 @@ class TestLegacyFormatter(TempDirCase):
         facade.dedup = MagicMock()
         facade.dedup.rebuild_index = AsyncMock(return_value=0)
         facade.dedup.register_file = AsyncMock(return_value=None)
+        facade.dedup.find_similar_duplicate = AsyncMock(return_value=None)
         plugin = MagicMock()
         plugin.paths = paths
         plugin.facade = facade
@@ -483,13 +494,14 @@ class TestLegacyFormatter(TempDirCase):
         return _review
 
     @staticmethod
-    def _prepare_and_wait(service):
+    def _prepare_and_wait(service, **prepare_kwargs):
         """在同一事件循环内 prepare 并等待后台分析 task 完成。"""
 
         async def _go():
-            await service.prepare()
+            await service.prepare(**prepare_kwargs)
             if service._task is not None:
                 await service._task
+            return service.status()
 
         return run(_go())
 
@@ -508,7 +520,8 @@ class TestLegacyFormatter(TempDirCase):
         self.assertEqual(status["succeeded"], 1)
         self.assertTrue(plugin.facade.format_busy)
 
-    def test_prepare_rejected_when_new_library_not_empty(self):
+    def test_prepare_allowed_when_new_library_not_empty(self):
+        # 需求①：两种来源均不要求新库为空，允许增量导入。
         plugin = self._make_plugin()
         run(plugin.facade.storage.add_asset(StickerAssetDraft(
             meme_def="x", storage_key="x.png", description="d", tags=("t",),
@@ -516,9 +529,12 @@ class TestLegacyFormatter(TempDirCase):
         self._make_legacy_db(plugin.paths.data_dir, [
             {"asset_id": "o1", "storage_key": "a.png"},
         ])
+        plugin.facade.review.review_image = self._review_ok("新名")
         service = formatter_mod.LegacyFormatService(plugin)
-        with self.assertRaises(ValueError):
-            run(service.prepare())
+        status = self._prepare_and_wait(service)
+        self.assertEqual(status["status"], "ready")
+        # 既有资产保留，识图结果在 staging 未提交前不并入
+        self.assertEqual(run(plugin.facade.storage.count_assets()), 1)
 
     def test_commit_writes_success_only_and_deletes_legacy(self):
         plugin = self._make_plugin()
@@ -735,6 +751,99 @@ class TestLegacyFormatter(TempDirCase):
         with self.assertRaises(ValueError):
             run(service.commit(job_id, confirm=True, discard_failed=True, partial=True))
 
+    # ---------- 需求①：扫描其他插件图片 ----------
+
+    def _make_sibling_plugin(self, name: str, images: dict) -> Path:
+        """在 data_dir.parent 下创建一个兄弟插件目录并放入图片。"""
+        target = self.tmp / name
+        for rel, color in images.items():
+            _make_png(target / rel, color)
+        return target
+
+    def test_list_sibling_plugin_dirs_counts_images(self):
+        plugin = self._make_plugin()
+        self._make_sibling_plugin("other_a", {"x.png": (1, 1, 1), "sub/y.jpg": (2, 2, 2)})
+        self._make_sibling_plugin("other_b", {"z.webp": (3, 3, 3)})
+        service = formatter_mod.LegacyFormatService(plugin)
+        dirs = service.list_sibling_plugin_dirs()
+        by_name = {d["name"]: d["image_count"] for d in dirs}
+        self.assertEqual(by_name.get("other_a"), 2)
+        self.assertEqual(by_name.get("other_b"), 1)
+        # 本插件目录（data）被排除
+        self.assertNotIn("data", by_name)
+
+    def test_scan_plugin_prepare_and_merge_keeps_source(self):
+        plugin = self._make_plugin()
+        target = self._make_sibling_plugin("meme_src", {"a.png": (5, 5, 5), "b.png": (6, 6, 6)})
+        plugin.facade.review.review_image = self._review_ok("导入名")
+        service = formatter_mod.LegacyFormatService(plugin)
+        status = self._prepare_and_wait(service, source="plugin_scan", plugin_dir_name="meme_src")
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["succeeded"], 2)
+        # 提交合并：plugin_scan 不删源文件
+        run(service.commit(status["job_id"], confirm=True, discard_failed=True))
+        self.assertEqual(run(plugin.facade.storage.count_assets()), 2)
+        self.assertTrue((target / "a.png").exists())
+        self.assertTrue((target / "b.png").exists())
+        # staging 清理
+        self.assertFalse((plugin.paths.data_dir / ".meme_format_staging").exists())
+
+    def test_plugin_dir_traversal_rejected(self):
+        plugin = self._make_plugin()
+        service = formatter_mod.LegacyFormatService(plugin)
+        for bad in ("..", "../x", "a/b", "data", "", "."):
+            with self.assertRaises(ValueError, msg=f"应拒绝 {bad!r}"):
+                run(service.prepare(source="plugin_scan", plugin_dir_name=bad))
+
+    def test_dedup_marks_duplicate_and_skips(self):
+        plugin = self._make_plugin()
+        self._make_sibling_plugin("meme_src", {"a.png": (7, 7, 7)})
+        dup = MagicMock()
+        dup.meme_def = "已有图"
+        plugin.facade.dedup.find_similar_duplicate = AsyncMock(return_value=dup)
+        plugin.facade.review.review_image = self._review_ok("名")
+        service = formatter_mod.LegacyFormatService(plugin)
+        status = self._prepare_and_wait(service, source="plugin_scan", plugin_dir_name="meme_src")
+        self.assertEqual(status["succeeded"], 0)
+        self.assertEqual(status["items"][0]["status"], "duplicate")
+        self.assertIn("已有图", status["items"][0]["reason"])
+
+    def test_plugin_scan_resume_continues(self):
+        plugin = self._make_plugin()
+        self._make_sibling_plugin("meme_src", {"a.png": (1, 2, 3), "b.png": (4, 5, 6)})
+        calls = {"n": 0}
+
+        async def cancel_second(image_url):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise asyncio.CancelledError()
+            return {"should_steal": True, "reason": "ok", "description": "d",
+                    "filename": "第一张", "tags": ["t"]}
+
+        plugin.facade.review.review_image = cancel_second
+        service = formatter_mod.LegacyFormatService(plugin)
+
+        async def first_round():
+            await service.prepare(source="plugin_scan", plugin_dir_name="meme_src")
+            if service._task is not None:
+                try:
+                    await service._task
+                except asyncio.CancelledError:
+                    pass
+        run(first_round())
+        self.assertEqual(service.status()["processed"], 1)
+
+        plugin.facade.review.review_image = self._review_ok("第二张")
+        service2 = formatter_mod.LegacyFormatService(plugin)
+
+        async def do_resume():
+            await service2.resume()
+            if service2._task is not None:
+                await service2._task
+        run(do_resume())
+        self.assertEqual(service2.status()["processed"], 2)
+        self.assertEqual(service2.status()["succeeded"], 2)
+
 
 class TestToolNames(TempDirCase):
     def test_constants(self):
@@ -747,6 +856,84 @@ class TestToolNames(TempDirCase):
     def test_legacy_modules_removed(self):
         self.assertFalse((PLUGIN_DIR / "legacy_bridge.py").exists())
         self.assertFalse((PLUGIN_DIR / "default" / "memes_data.json").exists())
+
+
+class TestThumbnail(TempDirCase):
+    """需求②：缩略图生成与缓存。"""
+
+    def _make_api(self):
+        page_api_mod = importlib.import_module(f"{_pkg_name}.page_api")
+        data_dir = self.tmp / "data"
+        paths = PluginPaths(
+            plugin_dir=self.tmp,
+            data_dir=data_dir,
+            stickers_dir=data_dir / "meme_defs",
+            metadata_db=data_dir / "meme_defs.sqlite3",
+        )
+        plugin = MagicMock()
+        plugin.paths = paths
+        api = page_api_mod.MoodPageApi.__new__(page_api_mod.MoodPageApi)
+        api.plugin = plugin
+        return api, paths
+
+    def _asset(self, asset_id="a1"):
+        return models_mod.StickerAsset(
+            asset_id=asset_id, meme_def="m", storage_key="x.png", tags=("t",),
+        )
+
+    def test_thumbnail_generated_and_reused(self):
+        api, paths = self._make_api()
+        src = paths.stickers_dir / "x.png"
+        _make_png(src, (200, 100, 50))
+        asset = self._asset()
+        thumb = run(api._get_or_create_thumbnail(asset, src))
+        self.assertIsNotNone(thumb)
+        self.assertTrue(thumb.exists())
+        self.assertEqual(thumb.suffix, ".webp")
+        # 尺寸不超过 256
+        from PIL import Image as PILImage
+        with PILImage.open(thumb) as im:
+            self.assertLessEqual(max(im.size), 256)
+        # 再次调用命中缓存（mtime 复用）
+        mtime1 = thumb.stat().st_mtime
+        thumb2 = run(api._get_or_create_thumbnail(asset, src))
+        self.assertEqual(thumb2.stat().st_mtime, mtime1)
+
+    def test_thumbnail_rebuilt_when_source_updated(self):
+        api, paths = self._make_api()
+        src = paths.stickers_dir / "x.png"
+        _make_png(src, (1, 2, 3))
+        asset = self._asset()
+        thumb = run(api._get_or_create_thumbnail(asset, src))
+        mtime1 = thumb.stat().st_mtime
+        # 真实替换原图内容（mtime 自然更新到更晚），触发重建
+        import time as _time
+        _time.sleep(0.02)
+        _make_png(src, (9, 9, 9))
+        thumb2 = run(api._get_or_create_thumbnail(asset, src))
+        self.assertGreater(thumb2.stat().st_mtime, mtime1)
+        # 再次调用命中缓存不重建
+        mtime2 = thumb2.stat().st_mtime
+        thumb3 = run(api._get_or_create_thumbnail(asset, src))
+        self.assertEqual(thumb3.stat().st_mtime, mtime2)
+
+    def test_thumbnail_invalid_image_returns_none(self):
+        api, paths = self._make_api()
+        src = paths.stickers_dir / "x.png"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_bytes(b"not an image")
+        asset = self._asset()
+        thumb = run(api._get_or_create_thumbnail(asset, src))
+        self.assertIsNone(thumb)
+
+    def test_delete_thumbnail(self):
+        api, paths = self._make_api()
+        thumb_dir = api._thumbnail_dir()
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        f = thumb_dir / "a1.webp"
+        f.write_bytes(b"x")
+        api.delete_thumbnail("a1")
+        self.assertFalse(f.exists())
 
 
 if __name__ == "__main__":
