@@ -172,6 +172,23 @@ class TestStorage(TempDirCase):
                 meme_def="猫", storage_key="b.png", description="d", tags=("t",),
             )))
 
+    def test_usage_table_created_and_record_usage(self):
+        storage = self._storage()
+        # sticker_usage 表已随初始化创建
+        with sqlite3.connect(str(storage.paths.metadata_db)) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("sticker_usage", tables)
+        # record_usage 不应报 no such table
+        asset = run(storage.add_asset(StickerAssetDraft(
+            meme_def="a", storage_key="a.png", description="d", tags=("t",),
+        )))
+        run(storage.record_usage(models_mod.StickerUsageEvent(
+            asset_id=asset.asset_id, scope_key="s", created_at=1.0,
+        )))
+        updated = run(storage.get_asset(asset.asset_id))
+        self.assertEqual(updated.usage_count, 1)
+        self.assertEqual(updated.last_used_at, 1.0)
+
     def test_required_fields(self):
         storage = self._storage()
         with self.assertRaises(ValueError):

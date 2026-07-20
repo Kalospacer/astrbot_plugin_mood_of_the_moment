@@ -97,6 +97,22 @@ class StickerStorage:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sticker_assets_usage_count ON sticker_assets(usage_count)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sticker_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sticker_usage_asset ON sticker_usage(asset_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sticker_usage_scope ON sticker_usage(scope_key, created_at)"
+            )
             conn.commit()
 
     @staticmethod

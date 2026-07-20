@@ -23,6 +23,8 @@ except Exception:  # pragma: no cover - Pillow 缺失时回退原图
     Image = None
 
 PAGE_API_PREFIX = f"/{PLUGIN_PACKAGE_NAME}/page"
+# 浏览器 <img>/fetch 直连插件接口的完整前缀（宿主经 /api/v1/plugins/extensions 转发，同源带鉴权）。
+BROWSER_API_PREFIX = f"/api/v1/plugins/extensions/{PLUGIN_PACKAGE_NAME}/page"
 THUMBNAIL_MAX_EDGE = 256
 THUMBNAIL_QUALITY = 80
 
@@ -505,8 +507,8 @@ class MoodPageApi:
             "last_used_at": int(asset.last_used_at or 0),
             "tags": list(asset.tags),
             "exists": resolved.exists() and resolved.is_file(),
-            "image_endpoint": f"/sticker/image?asset_id={quote(asset.asset_id, safe='')}",
-            "thumbnail_endpoint": f"/sticker/thumbnail?asset_id={quote(asset.asset_id, safe='')}",
+            "image_endpoint": f"{BROWSER_API_PREFIX}/sticker/image?asset_id={quote(asset.asset_id, safe='')}",
+            "thumbnail_endpoint": f"{BROWSER_API_PREFIX}/sticker/thumbnail?asset_id={quote(asset.asset_id, safe='')}",
         }
         if include_path:
             payload["file_path"] = asset.storage_key
