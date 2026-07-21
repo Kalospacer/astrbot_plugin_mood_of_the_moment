@@ -952,6 +952,47 @@ class TestThumbnail(TempDirCase):
         api.delete_thumbnail("a1")
         self.assertFalse(f.exists())
 
+    def test_thumbnail_data_url_is_webp(self):
+        # 回归：iframe 内 <img> 无法直连鉴权，列表缩略图必须经桥接以 webp base64 下发。
+        api, paths = self._make_api()
+        src = paths.stickers_dir / "x.png"
+        _make_png(src, (10, 20, 30))
+        payload = run(api._encode_thumbnail_data_url(self._asset(), src))
+        self.assertEqual(payload["mime"], "image/webp")
+        self.assertTrue(payload["data_url"].startswith("data:image/webp;base64,"))
+        import base64 as _b64, io as _io
+        from PIL import Image as PILImage
+        raw = _b64.b64decode(payload["data_url"].split(",", 1)[1])
+        with PILImage.open(_io.BytesIO(raw)) as im:
+            self.assertEqual(im.format, "WEBP")
+            self.assertLessEqual(max(im.size), 256)
+
+    def test_thumbnail_data_url_falls_back_to_original_without_pillow(self):
+        api, paths = self._make_api()
+        src = paths.stickers_dir / "x.png"
+        _make_png(src, (5, 5, 5))
+        page_api_mod = importlib.import_module(f"{_pkg_name}.page_api")
+        original = page_api_mod.Image
+        page_api_mod.Image = None  # 模拟 Pillow 缺失
+        try:
+            payload = run(api._encode_thumbnail_data_url(self._asset(), src))
+        finally:
+            page_api_mod.Image = original
+        self.assertEqual(payload["mime"], "image/png")
+        self.assertTrue(payload["data_url"].startswith("data:image/png;base64,"))
+
+    def test_serialize_asset_uses_bridge_data_endpoints(self):
+        # 回归：端点必须是桥接可取的相对 data 路径，绝不能退回无法鉴权的直连 URL。
+        api, paths = self._make_api()
+        api.plugin.facade.storage.resolve_path = AsyncMock(
+            return_value=paths.stickers_dir / "missing.png"
+        )
+        payload = run(api._serialize_asset(self._asset(), include_path=False))
+        self.assertTrue(payload["thumbnail_endpoint"].startswith("/sticker/thumbnail_data?asset_id="))
+        self.assertTrue(payload["image_endpoint"].startswith("/sticker/image_data?asset_id="))
+        self.assertNotIn("/api/v1/plugins/extensions", payload["thumbnail_endpoint"])
+        self.assertNotIn("/api/v1/plugins/extensions", payload["image_endpoint"])
+
 
 class TestFacadeThumbnailPrune(TempDirCase):
     """回归：启动清理孤兒缩略图时，数据库异常不得误删全部缩略图。"""

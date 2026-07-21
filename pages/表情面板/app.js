@@ -8,6 +8,7 @@ const state = {
   selectedAsset: null,
   selectedIds: new Set(),
   isSelectMode: false,
+  imageCache: new Map(),
   filters: {
     q: "",
     tag: "",
@@ -231,7 +232,7 @@ function renderStickerWall() {
     <article class="sticker ${state.selectedIds.has(asset.asset_id) ? "is-selected" : ""} ${asset.exists ? "" : "missing"}" data-asset-id="${escapeHtml(asset.asset_id)}">
       <input class="sticker-select" type="checkbox" data-select-asset="${escapeHtml(asset.asset_id)}" ${state.selectedIds.has(asset.asset_id) ? "checked" : ""} aria-label="选择" />
       <div class="thumb" data-open-asset="${escapeHtml(asset.asset_id)}">
-        ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" loading="lazy" data-thumb-src="${escapeHtml(asset.thumbnail_endpoint || "")}" />` : `<span class="missing-text">文件缺失</span>`}
+        ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" loading="lazy" data-fetch-src="${escapeHtml(asset.thumbnail_endpoint || "")}" />` : `<span class="missing-text">文件缺失</span>`}
       </div>
       <div class="sticker-meta">
         <b title="${escapeHtml(asset.meme_def)}">:${escapeHtml(asset.meme_def)}:</b>
@@ -253,14 +254,29 @@ function renderSelectionBar() {
   }
 }
 
-function hydrateImages(root = document) {
-  // 列表缩略图与详情原图都直接赋 endpoint，浏览器原生 HTTP 缓存，无需 base64。
-  root.querySelectorAll("img[data-thumb-src]").forEach((img) => {
-    if (!img.src && img.dataset.thumbSrc) img.src = img.dataset.thumbSrc;
-  });
-  root.querySelectorAll("img[data-image-src]").forEach((img) => {
-    if (!img.src && img.dataset.imageSrc) img.src = img.dataset.imageSrc;
-  });
+async function hydrateImages(root = document) {
+  // iframe 内的 <img> 无法自带鉴权头（后台用 Bearer，非 Cookie），直连 URL 必 401。
+  // 统一经桥接以 base64 取图：列表取缩略图端点省带宽，详情取原图端点；按端点缓存去重。
+  const imgs = [...root.querySelectorAll("img[data-fetch-src]")];
+  await Promise.all(imgs.map(async (img) => {
+    const endpoint = img.dataset.fetchSrc;
+    if (!endpoint || img.src) return;
+    if (state.imageCache.has(endpoint)) {
+      img.src = state.imageCache.get(endpoint);
+      return;
+    }
+    try {
+      const result = await fetchJson(endpoint);
+      if (result?.data_url) {
+        state.imageCache.set(endpoint, result.data_url);
+        img.src = result.data_url;
+      } else {
+        img.alt = "图片加载失败";
+      }
+    } catch (error) {
+      img.alt = "图片加载失败";
+    }
+  }));
 }
 
 function renderDetailDrawer() {
@@ -273,7 +289,7 @@ function renderDetailDrawer() {
   }
   panel.innerHTML = `
     <div class="detail-image">
-      ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-image-src="${escapeHtml(asset.image_endpoint || "")}" />` : `<span class="missing-text">文件缺失</span>`}
+      ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-fetch-src="${escapeHtml(asset.image_endpoint || "")}" />` : `<span class="missing-text">文件缺失</span>`}
     </div>
     <form id="detailForm" class="detail-form">
       <label><span>meme_def（唯一名称）</span><input name="meme_def" value="${escapeHtml(asset.meme_def)}" required /></label>

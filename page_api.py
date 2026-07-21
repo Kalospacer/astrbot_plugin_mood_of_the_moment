@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import quote
 
 from astrbot.api import logger
-from quart import request, send_file
+from quart import request
 
 from .constants import PLUGIN_NAME, PLUGIN_PACKAGE_NAME
 from .legacy_formatter import LegacyFormatService
@@ -23,8 +23,6 @@ except Exception:  # pragma: no cover - Pillow 缺失时回退原图
     Image = None
 
 PAGE_API_PREFIX = f"/{PLUGIN_PACKAGE_NAME}/page"
-# 浏览器 <img>/fetch 直连插件接口的完整前缀（宿主经 /api/v1/plugins/extensions 转发，同源带鉴权）。
-BROWSER_API_PREFIX = f"/api/v1/plugins/extensions/{PLUGIN_PACKAGE_NAME}/page"
 THUMBNAIL_MAX_EDGE = 256
 THUMBNAIL_QUALITY = 80
 
@@ -43,9 +41,8 @@ class MoodPageApi:
             ("/overview", self.get_overview, ["GET"], "Mood sticker page overview"),
             ("/stickers", self.list_stickers, ["GET"], "Mood sticker page list"),
             ("/sticker", self.get_sticker, ["GET"], "Mood sticker page detail"),
-            ("/sticker/image", self.get_sticker_image, ["GET"], "Mood sticker image"),
-            ("/sticker/thumbnail", self.get_sticker_thumbnail, ["GET"], "Mood sticker thumbnail"),
             ("/sticker/image_data", self.get_sticker_image_data, ["GET"], "Mood sticker image data"),
+            ("/sticker/thumbnail_data", self.get_sticker_thumbnail_data, ["GET"], "Mood sticker thumbnail data"),
             ("/sticker/import", self.import_sticker, ["POST"], "Mood sticker import"),
             ("/sticker/upload", self.upload_sticker, ["POST"], "Mood sticker upload"),
             ("/sticker/update", self.update_sticker, ["POST"], "Mood sticker update"),
@@ -146,29 +143,6 @@ class MoodPageApi:
             return self._error("没有找到这个贴纸")
         return self._ok(await self._serialize_asset(asset, include_path=True))
 
-    async def get_sticker_image(self):
-        resolved = await self._resolve_asset_image_path()
-        if isinstance(resolved, dict):
-            return self._error(str(resolved.get("error") or "图片不存在"))
-        response = await send_file(resolved)
-        response.headers["Cache-Control"] = "public, max-age=3600"
-        return response
-
-    async def get_sticker_thumbnail(self):
-        asset_id = self._query("asset_id", 120)
-        asset = await self.plugin.facade.storage.get_asset(asset_id) if asset_id else None
-        if asset is None:
-            return self._error("没有找到这个贴纸")
-        source = await self.plugin.facade.storage.resolve_path(asset.storage_key)
-        if not source.exists():
-            return self._error("图片文件不存在")
-        thumb = await self._get_or_create_thumbnail(asset, source)
-        # 生成失败时回退原图，保证可用。
-        target = thumb if thumb is not None else source
-        response = await send_file(target)
-        response.headers["Cache-Control"] = "public, max-age=86400"
-        return response
-
     def _thumbnail_dir(self) -> Path:
         return self.plugin.paths.data_dir / ".thumbnails"
 
@@ -244,6 +218,31 @@ class MoodPageApi:
         except Exception as exc:
             logger.error(f"{PLUGIN_NAME}: WebUI image read failed: {exc}", exc_info=True)
             return self._error(str(exc))
+
+    async def get_sticker_thumbnail_data(self) -> dict[str, Any]:
+        asset_id = self._query("asset_id", 120)
+        asset = await self.plugin.facade.storage.get_asset(asset_id) if asset_id else None
+        if asset is None:
+            return self._error("没有找到这个贴纸")
+        source = await self.plugin.facade.storage.resolve_path(asset.storage_key)
+        if not source.exists():
+            return self._error("图片文件不存在")
+        try:
+            return self._ok(await self._encode_thumbnail_data_url(asset, source))
+        except Exception as exc:
+            logger.error(f"{PLUGIN_NAME}: WebUI thumbnail read failed: {exc}", exc_info=True)
+            return self._error(str(exc))
+
+    async def _encode_thumbnail_data_url(self, asset: StickerAsset, source: Path) -> dict[str, str]:
+        # iframe 内的 <img> 无法自带鉴权头，只能经桥接以 base64 取图；列表用小缩略图省带宽。
+        thumb = await self._get_or_create_thumbnail(asset, source)
+        if thumb is not None:
+            raw = await asyncio.to_thread(thumb.read_bytes)
+            return {"data_url": f"data:image/webp;base64,{base64.b64encode(raw).decode('ascii')}", "mime": "image/webp"}
+        # Pillow 缺失或原图无法缩略时回退原图字节，保证仍可显示。
+        raw = await asyncio.to_thread(source.read_bytes)
+        mime = mimetypes.guess_type(str(source))[0] or "image/png"
+        return {"data_url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}", "mime": mime}
 
     async def import_sticker(self) -> dict[str, Any]:
         payload = await request.get_json(silent=True) or {}
@@ -507,8 +506,9 @@ class MoodPageApi:
             "last_used_at": int(asset.last_used_at or 0),
             "tags": list(asset.tags),
             "exists": resolved.exists() and resolved.is_file(),
-            "image_endpoint": f"{BROWSER_API_PREFIX}/sticker/image?asset_id={quote(asset.asset_id, safe='')}",
-            "thumbnail_endpoint": f"{BROWSER_API_PREFIX}/sticker/thumbnail?asset_id={quote(asset.asset_id, safe='')}",
+            # 相对路径，前端经 fetchJson→桥接 apiGet 取 base64；不能用直连 URL（iframe 内 <img> 无鉴权）。
+            "image_endpoint": f"/sticker/image_data?asset_id={quote(asset.asset_id, safe='')}",
+            "thumbnail_endpoint": f"/sticker/thumbnail_data?asset_id={quote(asset.asset_id, safe='')}",
         }
         if include_path:
             payload["file_path"] = asset.storage_key
