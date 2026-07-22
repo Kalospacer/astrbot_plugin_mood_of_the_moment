@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>此刻的心情</title>
-  <link rel="stylesheet" href="./app.css?v=20260721-v2" />
+  <link rel="stylesheet" href="./app.css?v=20260723-v4" />
 </head>
 <body>
   <main class="shell">
@@ -16,7 +16,6 @@
       <div class="header-actions">
         <button id="docsViewBtn" type="button" class="ghost">文档</button>
         <button id="refreshBtn" type="button" class="ghost">刷新</button>
-        <button id="selectModeBtn" type="button" class="ghost">选择</button>
         <button id="openFormatBtn" type="button" class="ghost">格式化旧库</button>
         <button id="openSettingsBtn" type="button" class="ghost">设置</button>
         <button id="openImportBtn" type="button" class="primary">添加表情</button>
@@ -42,6 +41,7 @@
           <option value="desc">降序</option>
           <option value="asc">升序</option>
         </select>
+        <button id="bulkSelectBtn" type="button" class="accent">批量选择</button>
         <button id="pruneBtn" type="button" class="ghost danger-text">清理缺失</button>
       </div>
       <div class="tag-row">
@@ -53,14 +53,22 @@
     <section class="library" id="mainView">
       <div id="selectionBar" class="selection-bar" hidden>
         <span id="selectionCount">已选 0 张</span>
+        <button id="selectAllPageBtn" type="button" class="ghost">全选本页</button>
+        <button id="invertPageBtn" type="button" class="ghost">反选本页</button>
         <button id="bulkDeleteBtn" type="button" class="danger">删除选中</button>
         <button id="cancelSelectBtn" type="button" class="ghost">退出选择</button>
       </div>
       <div id="stickerWall" class="sticker-wall"></div>
       <div class="pager">
         <button id="prevPageBtn" type="button" class="ghost">上一页</button>
-        <span id="pageInfo"></span>
+        <div id="pageNumbers" class="page-numbers"></div>
         <button id="nextPageBtn" type="button" class="ghost">下一页</button>
+        <span class="page-jump">
+          跳至
+          <input id="pageJumpInput" type="number" min="1" inputmode="numeric" />
+          / <b id="pageTotal">1</b> 页
+          <button id="pageJumpBtn" type="button" class="ghost">跳转</button>
+        </span>
       </div>
     </section>
 
@@ -124,6 +132,14 @@
       </article>
     </section>
   </main>
+
+  <!-- 漫画阅读式左右悬浮翻页按钮 -->
+  <button id="floatPrevBtn" type="button" class="page-float left" aria-label="上一页" hidden>
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+  </button>
+  <button id="floatNextBtn" type="button" class="page-float right" aria-label="下一页" hidden>
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+  </button>
 
   <aside id="detailDrawer" class="drawer" aria-hidden="true">
     <div class="drawer-head">
@@ -211,6 +227,6 @@
   </section>
 
   <div id="toast" class="toast" aria-live="polite"></div>
-  <script src="./app.js?v=20260721-v2"></script>
+  <script src="./app.js?v=20260723-v4"></script>
 </body>
 </html>

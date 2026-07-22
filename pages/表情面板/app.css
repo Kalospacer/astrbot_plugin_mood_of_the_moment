@@ -143,6 +143,25 @@ h2 {
   background: var(--line);
 }
 
+/* 筛选行里的高亮入口按钮（批量选择） */
+.accent {
+  background: #2563eb;
+  color: #ffffff;
+  padding: 8px 16px;
+  border-radius: var(--radius);
+  font-weight: 500;
+  font-size: 14px;
+  border: 1px solid #2563eb;
+  transition: background 0.2s, box-shadow 0.2s;
+  box-shadow: 0 1px 2px rgba(37, 99, 235, 0.35);
+  white-space: nowrap;
+}
+
+.accent:hover {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+}
+
 .danger {
   background: var(--danger);
   color: #fff;
@@ -377,10 +396,13 @@ body.is-select-mode .thumb {
   border-radius: 99px;
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
   box-shadow: var(--shadow-lg);
   z-index: 100;
   animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  max-width: calc(100vw - 32px);
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .selection-bar[hidden] {
@@ -390,6 +412,17 @@ body.is-select-mode .thumb {
 .selection-bar .ghost {
   color: var(--surface);
   border-color: rgba(255, 255, 255, 0.2);
+  padding: 6px 12px;
+}
+
+.selection-bar .danger {
+  padding: 6px 12px;
+}
+
+#selectionCount {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  white-space: nowrap;
 }
 
 .selection-bar .ghost:hover {
@@ -408,12 +441,126 @@ body.is-select-mode .thumb {
   justify-content: center;
   gap: 16px;
   margin-top: 32px;
+  flex-wrap: wrap;
 }
 
-#pageInfo {
+/* 论坛式页码按钮 */
+.page-numbers {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.page-num {
+  min-width: 32px;
+  height: 32px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
   font-family: var(--font-mono);
   font-size: 13px;
+  display: inline-grid;
+  place-items: center;
+  transition: all 0.15s;
+}
+
+.page-num:hover {
+  background: var(--line);
+}
+
+.page-num.is-active {
+  background: var(--ink);
+  color: var(--surface);
+  border-color: var(--ink);
+  cursor: default;
+}
+
+.page-ellipsis {
   color: var(--ink-muted);
+  padding: 0 2px;
+  user-select: none;
+  font-family: var(--font-mono);
+}
+
+/* 跳页输入 */
+.page-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+}
+
+.page-jump b {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.page-jump input {
+  width: 64px;
+  padding: 6px 8px;
+  text-align: center;
+  font-family: var(--font-mono);
+}
+
+/* 隐藏 number input 的上下箭头，保持输入框干净 */
+.page-jump input::-webkit-outer-spin-button,
+.page-jump input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.page-jump input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* 漫画阅读式左右悬浮圆形翻页按钮 */
+.page-float {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-md);
+  color: var(--ink);
+  display: grid;
+  place-items: center;
+  z-index: 90;
+  opacity: 0.92;
+  transition: background 0.2s, color 0.2s, transform 0.2s, opacity 0.2s;
+}
+
+.page-float:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--surface);
+  border-color: var(--ink);
+  transform: translateY(-50%) scale(1.08);
+  opacity: 1;
+}
+
+.page-float:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.page-float.left {
+  left: 20px;
+}
+
+.page-float.right {
+  right: 20px;
+}
+
+.page-float[hidden] {
+  display: none;
 }
 
 /* Drawer */
@@ -715,6 +862,20 @@ body.is-select-mode .thumb {
   }
   .drawer {
     width: 100%;
+  }
+  .page-float {
+    width: 38px;
+    height: 38px;
+  }
+  .page-float.left {
+    left: 8px;
+  }
+  .page-float.right {
+    right: 8px;
+  }
+  .page-jump {
+    width: 100%;
+    justify-content: center;
   }
 }
 

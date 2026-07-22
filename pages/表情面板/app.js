@@ -8,6 +8,7 @@ const state = {
   selectedAsset: null,
   selectedIds: new Set(),
   isSelectMode: false,
+  docsMode: false,
   imageCache: new Map(),
   filters: {
     q: "",
@@ -308,12 +309,76 @@ function renderDetailDrawer() {
   hydrateImages(panel);
 }
 
+// 论坛式页码序列：页数少时全展示，多时折叠为 1 … c-1 c c+1 … N
+function buildPageList(current, total) {
+  if (total <= 9) return Array.from({ length: total }, (_, i) => i + 1);
+  const keep = new Set([1, 2, current - 1, current, current + 1, total - 1, total]);
+  const sorted = [...keep].filter((p) => p >= 1 && p <= total).sort((a, b) => a - b);
+  const out = [];
+  let prev = 0;
+  for (const p of sorted) {
+    if (p - prev > 1) out.push("…");
+    out.push(p);
+    prev = p;
+  }
+  return out;
+}
+
+function totalPages() {
+  const { pageSize, total } = state.filters;
+  return Math.max(1, Math.ceil(total / pageSize));
+}
+
+// 统一跳页入口：夹取范围、拉数据、渲染，并滚回列表顶部（漫画式翻页体验）
+async function goToPage(target, { scroll = true } = {}) {
+  const pages = totalPages();
+  const next = Math.min(pages, Math.max(1, Number(target) || 1));
+  if (next === state.filters.page) return;
+  state.filters.page = next;
+  await loadStickers();
+  renderAll();
+  if (scroll) {
+    const library = document.querySelector(".library");
+    if (library) library.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
 function renderPager() {
-  const { page, pageSize, total } = state.filters;
-  const pages = Math.max(1, Math.ceil(total / pageSize));
-  $("#pageInfo").textContent = `${page} / ${pages}`;
+  const { page } = state.filters;
+  const pages = totalPages();
   $("#prevPageBtn").disabled = page <= 1;
   $("#nextPageBtn").disabled = page >= pages;
+
+  const numbers = $("#pageNumbers");
+  if (numbers) {
+    numbers.innerHTML = buildPageList(page, pages).map((p) =>
+      p === "…"
+        ? `<span class="page-ellipsis">…</span>`
+        : `<button type="button" class="page-num ${p === page ? "is-active" : ""}" data-page="${p}">${p}</button>`
+    ).join("");
+  }
+
+  const jumpInput = $("#pageJumpInput");
+  if (jumpInput) {
+    jumpInput.max = String(pages);
+    jumpInput.placeholder = String(page);
+    if (document.activeElement !== jumpInput) jumpInput.value = "";
+  }
+  const pageTotal = $("#pageTotal");
+  if (pageTotal) pageTotal.textContent = String(pages);
+
+  // 左右悬浮圆形翻页按钮：多页且非文档视图时显示，首末页禁用
+  const showFloat = pages > 1 && !state.docsMode;
+  const floatPrev = $("#floatPrevBtn");
+  const floatNext = $("#floatNextBtn");
+  if (floatPrev) {
+    floatPrev.hidden = !showFloat;
+    floatPrev.disabled = page <= 1;
+  }
+  if (floatNext) {
+    floatNext.hidden = !showFloat;
+    floatNext.disabled = page >= pages;
+  }
 }
 
 async function selectAssetForEdit(assetId) {
@@ -328,7 +393,13 @@ function toggleSelectMode(on) {
   if (!on) state.selectedIds.clear();
   renderStickerWall();
   renderSelectionBar();
-  $("#selectModeBtn").hidden = on;
+  // 筛选行里的「批量选择」按钮原地切换为「退出选择」，入口始终可见
+  const btn = $("#bulkSelectBtn");
+  if (btn) {
+    btn.textContent = on ? "退出选择" : "批量选择";
+    btn.classList.toggle("accent", !on);
+    btn.classList.toggle("ghost", on);
+  }
   $("#openImportBtn").hidden = on;
   $("#refreshBtn").hidden = on;
 }
@@ -769,10 +840,8 @@ async function cancelFormatJob(jobId) {
 // ---------- 全局事件 ----------
 
 // 文档视图切换
-let docsMode = false;
 function toggleDocsView(on) {
-  docsMode = on;
-  const main = document.querySelector(".shell");
+  state.docsMode = on;
   ["#stats", ".filter-panel", "#mainView"].forEach((sel) => {
     const el = document.querySelector(sel);
     if (el) el.hidden = on;
@@ -785,18 +854,19 @@ function toggleDocsView(on) {
     btn.classList.toggle("primary", on);
     btn.classList.toggle("ghost", !on);
   }
-  // 文档模式下隐藏其他操作按钮
-  ["#refreshBtn", "#selectModeBtn", "#openFormatBtn", "#openSettingsBtn", "#openImportBtn"].forEach((sel) => {
+  // 文档模式下隐藏其他操作按钮（含筛选行里的批量选择入口）
+  ["#refreshBtn", "#bulkSelectBtn", "#openFormatBtn", "#openSettingsBtn", "#openImportBtn"].forEach((sel) => {
     const el = document.querySelector(sel);
     if (el) el.hidden = on;
   });
+  renderPager();
 }
 
 document.addEventListener("click", async (event) => {
   const target = event.target;
 
   if (target.id === "docsViewBtn") {
-    toggleDocsView(!docsMode);
+    toggleDocsView(!state.docsMode);
     return;
   }
 
@@ -854,8 +924,8 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  if (target.id === "selectModeBtn") {
-    toggleSelectMode(true);
+  if (target.id === "bulkSelectBtn") {
+    toggleSelectMode(!state.isSelectMode);
     return;
   }
   if (target.id === "cancelSelectBtn") {
@@ -902,16 +972,27 @@ document.addEventListener("click", async (event) => {
     await reloadAfterMutation("已刷新");
     return;
   }
-  if (target.id === "prevPageBtn") {
-    state.filters.page = Math.max(1, state.filters.page - 1);
-    await loadStickers();
-    renderAll();
+  if (target.id === "prevPageBtn" || target.closest?.("#floatPrevBtn")) {
+    await goToPage(state.filters.page - 1);
     return;
   }
-  if (target.id === "nextPageBtn") {
-    state.filters.page += 1;
-    await loadStickers();
-    renderAll();
+  if (target.id === "nextPageBtn" || target.closest?.("#floatNextBtn")) {
+    await goToPage(state.filters.page + 1);
+    return;
+  }
+  const pageBtn = target.closest?.("[data-page]");
+  if (pageBtn) {
+    await goToPage(Number(pageBtn.dataset.page));
+    return;
+  }
+  if (target.id === "pageJumpBtn") {
+    const input = $("#pageJumpInput");
+    const value = parseInt(input?.value, 10);
+    if (!Number.isFinite(value)) {
+      showToast(`请输入 1 - ${totalPages()} 之间的页码`, "error");
+      return;
+    }
+    await goToPage(value);
     return;
   }
 
@@ -930,6 +1011,24 @@ document.addEventListener("click", async (event) => {
     } catch (err) {
       showToast(err.message || "删除失败", "error");
     }
+    return;
+  }
+
+  if (target.id === "selectAllPageBtn") {
+    // 全选本页：把当前页的 id 并入选择集（不清空其他页已选）
+    state.stickers.forEach((asset) => state.selectedIds.add(asset.asset_id));
+    renderStickerWall();
+    renderSelectionBar();
+    return;
+  }
+  if (target.id === "invertPageBtn") {
+    // 反选本页：本页已选的移除、未选的加入，其他页保持不动
+    state.stickers.forEach((asset) => {
+      if (state.selectedIds.has(asset.asset_id)) state.selectedIds.delete(asset.asset_id);
+      else state.selectedIds.add(asset.asset_id);
+    });
+    renderStickerWall();
+    renderSelectionBar();
     return;
   }
 
@@ -1005,6 +1104,29 @@ $("#searchInput")?.addEventListener("input", debounce(async (event) => {
   await loadStickers();
   renderAll();
 }, 220));
+
+// 跳页输入框：回车直接跳转
+$("#pageJumpInput")?.addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  const value = parseInt(event.target.value, 10);
+  if (!Number.isFinite(value)) {
+    showToast(`请输入 1 - ${totalPages()} 之间的页码`, "error");
+    return;
+  }
+  await goToPage(value);
+});
+
+// 键盘 ← → 翻页（漫画阅读习惯）：输入框聚焦、文档视图、弹窗打开时不响应
+document.addEventListener("keydown", async (event) => {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  const active = document.activeElement;
+  if (active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName)) return;
+  if (state.docsMode) return;
+  if (document.querySelector(".modal:not([hidden])")) return;
+  if (event.key === "ArrowLeft") await goToPage(state.filters.page - 1);
+  else await goToPage(state.filters.page + 1);
+});
 
 const fileInput = $("#fileInput");
 if (fileInput) {
