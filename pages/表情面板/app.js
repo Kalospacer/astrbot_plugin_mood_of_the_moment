@@ -498,6 +498,14 @@ function renderSettingsForm() {
       <input name="only_store_emojis" type="checkbox" ${c.only_store_emojis ? "checked" : ""} />
       <span>仅偷取商城表情</span>
     </label>
+    <div class="settings-section">
+      <span class="settings-section-title">维护工具</span>
+      <div class="settings-maintenance">
+        <button id="openFormatBtn" type="button" class="ghost">格式化旧库</button>
+        <button id="pruneBtn" type="button" class="ghost danger-text">清理缺失</button>
+      </div>
+      <p class="settings-hint">格式化旧库：用视觉模型重新识别旧库图片并迁移入库；清理缺失：删除文件已丢失的数据库记录。</p>
+    </div>
   `;
 }
 
@@ -855,7 +863,7 @@ function toggleDocsView(on) {
     btn.classList.toggle("ghost", !on);
   }
   // 文档模式下隐藏其他操作按钮（含筛选行里的批量选择入口）
-  ["#refreshBtn", "#bulkSelectBtn", "#openFormatBtn", "#openSettingsBtn", "#openImportBtn"].forEach((sel) => {
+  ["#refreshBtn", "#bulkSelectBtn", "#openSettingsBtn", "#openImportBtn"].forEach((sel) => {
     const el = document.querySelector(sel);
     if (el) el.hidden = on;
   });
@@ -894,6 +902,8 @@ document.addEventListener("click", async (event) => {
   }
 
   if (target.id === "openFormatBtn") {
+    // 从设置弹窗进入时先收起设置，避免两个弹窗叠层
+    $("#settingsModal").hidden = true;
     await openFormatModal();
     return;
   }

@@ -831,6 +831,40 @@ body.is-select-mode .thumb {
   resize: vertical;
 }
 
+/* 设置弹窗里的维护工具区（格式化旧库 / 清理缺失） */
+.settings-section {
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-section-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-muted);
+  font-weight: 600;
+}
+
+.settings-maintenance {
+  display: flex;
+  gap: 12px;
+}
+
+.settings-maintenance button {
+  flex: 1;
+}
+
+.settings-hint {
+  font-size: 12px;
+  color: var(--ink-muted);
+  line-height: 1.6;
+  margin: 0;
+}
+
 @media (max-width: 640px) {
   .settings-body .form-grid {
     grid-template-columns: 1fr;
