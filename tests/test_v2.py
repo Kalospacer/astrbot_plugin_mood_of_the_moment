@@ -305,6 +305,15 @@ class TestRenderer(TempDirCase):
         self.assertNotIn("不存在的东西", text)
         self.assertEqual([s for s in decorated.segments if s.kind == "image"], [])
 
+    def test_unified_msg_origin_is_not_parsed_as_marker(self):
+        storage = _FakeFacadeStorage([_meme("a", ("x",))])
+        renderer = StickerRenderer(storage)
+        sid = "michelle2:GroupMessage:22211F6D40B764DA5DA8FE38182B5D37"
+        decorated = run(renderer.decorate_text(f"UMO: 「{sid}」", "s"))
+        text = "".join(s.value for s in decorated.segments if s.kind == "text")
+        self.assertEqual(text, f"UMO: 「{sid}」")
+        self.assertEqual([s for s in decorated.segments if s.kind == "image"], [])
+
     def test_stable_tiebreak_by_meme_def(self):
         storage = _FakeFacadeStorage([
             _meme("b_same", ("二次元",)),
