@@ -149,7 +149,7 @@ class MoodOfTheMomentPlugin(Star):
         _ = event
         _inject_sticker_reminder(req, await self.facade.build_llm_summary())
 
-    @filter.on_decorating_result()
+    @filter.on_decorating_result(priority=500)
     async def on_decorating_result(self, event: AstrMessageEvent):
         result = event.get_result()
         if result is None or not getattr(result, "chain", None):
