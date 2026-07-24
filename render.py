@@ -57,7 +57,7 @@ class StickerRenderer:
         #（例如 `michelle2:GroupMessage:123`）中的 `:GroupMessage:` 当成标签，
         # 进而在未命中资产时丢失原始会话 ID。
         pattern = re.compile(
-            r"(?<![\w-])"
+            r"(?<![a-zA-Z0-9_-])"
             r"(?:(?::|：)[a-zA-Z0-9_\-\u4e00-\u9fff ]+)+(?:[:：])"
         )
         token_pattern = re.compile(r"[:：]([a-zA-Z0-9_\-\u4e00-\u9fff ]+)")
