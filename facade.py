@@ -555,7 +555,13 @@ class PluginFacade:
                         },
                     )
                 )
-        scored.sort(key=lambda item: (-item[0], item[1]["meme_def"].casefold()))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                item[1]["usage_count"],
+                item[1]["meme_def"].casefold(),
+            )
+        )
         return [item[1] for item in scored[: max(1, min(int(limit), 20))]]
 
     async def maybe_run_cleanup(self) -> None:

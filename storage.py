@@ -482,12 +482,27 @@ class StickerStorage:
 
     async def get_all_tags(self) -> list[str]:
         assets = await self.query_assets()
-        return sorted({tag for asset in assets for tag in asset.tags}, key=str.casefold)
+        cold: dict[str, tuple[int, float]] = {}
+        for asset in assets:
+            key = (
+                asset.usage_count,
+                asset.last_used_at if asset.last_used_at is not None else 0.0,
+            )
+            for tag in asset.tags:
+                if tag not in cold or key < cold[tag]:
+                    cold[tag] = key
+        return sorted(cold, key=lambda tag: (cold[tag], tag.casefold()))
 
     async def get_all_meme_defs(self, limit: int | None = None) -> list[str]:
         assets = await self.query_assets()
+        by_def = {asset.meme_def: asset for asset in assets}
         definitions = sorted(
-            {asset.meme_def for asset in assets}, key=str.casefold
+            by_def,
+            key=lambda d: (
+                by_def[d].usage_count,
+                by_def[d].last_used_at if by_def[d].last_used_at is not None else 0.0,
+                d.casefold(),
+            ),
         )
         return definitions[:limit] if limit is not None else definitions
 

@@ -217,6 +217,40 @@ class TestStorage(TempDirCase):
         any_tag = run(storage.query_assets(tags=("二次元", "疲惫"), match_all=False))
         self.assertEqual(len(any_tag), 2)
 
+    def test_get_all_meme_defs_cold_first(self):
+        storage = self._storage()
+        for def_name in ("hot", "fresh", "b"):
+            run(storage.add_asset(StickerAssetDraft(
+                meme_def=def_name, storage_key=f"{def_name}.png",
+                description="d", tags=("t",),
+            )))
+        hot = run(storage.get_asset_by_meme_def("hot"))
+        run(storage.record_usage(models_mod.StickerUsageEvent(
+            asset_id=hot.asset_id, scope_key="s", created_at=100.0,
+        )))
+        run(storage.record_usage(models_mod.StickerUsageEvent(
+            asset_id=hot.asset_id, scope_key="s", created_at=200.0,
+        )))
+        # 冷门优先；同冷度（都未用过）退 casefold 字典序
+        self.assertEqual(run(storage.get_all_meme_defs()), ["b", "fresh", "hot"])
+        self.assertEqual(run(storage.get_all_meme_defs(limit=1)), ["b"])
+
+    def test_get_all_tags_cold_first(self):
+        storage = self._storage()
+        run(storage.add_asset(StickerAssetDraft(
+            meme_def="hot", storage_key="hot.png",
+            description="d", tags=("hot_tag",),
+        )))
+        run(storage.add_asset(StickerAssetDraft(
+            meme_def="cold", storage_key="cold.png",
+            description="d", tags=("cold_tag",),
+        )))
+        hot = run(storage.get_asset_by_meme_def("hot"))
+        run(storage.record_usage(models_mod.StickerUsageEvent(
+            asset_id=hot.asset_id, scope_key="s", created_at=100.0,
+        )))
+        self.assertEqual(run(storage.get_all_tags()), ["cold_tag", "hot_tag"])
+
 
 class _FakeFacadeStorage:
     """为 renderer 测试提供最小 storage 接口。"""
@@ -326,6 +360,17 @@ class TestRenderer(TempDirCase):
         img2 = [s.value for s in second.segments if s.kind == "image"]
         self.assertEqual(img1, img2)
         self.assertIn("a_same", img1[0])
+
+    def test_tag_tiebreak_prefers_never_used(self):
+        storage = _FakeFacadeStorage([
+            _meme("used", ("二次元",), usage=5, last_used=500),
+            _meme("fresh", ("二次元",)),
+        ])
+        renderer = StickerRenderer(storage)
+        decorated = run(renderer.decorate_text(":二次元:", "s"))
+        images = [s for s in decorated.segments if s.kind == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertIn("fresh.png", images[0].value)
 
     def test_prompt_catalog_injects_defs_and_tags_stable(self):
         storage = _FakeFacadeStorage([
@@ -877,7 +922,7 @@ class TestToolNames(TempDirCase):
         self.assertEqual(constants.STEAL_TOOL_NAME, "mood_steal_memes")
         self.assertEqual(constants.CHECK_MEMES_DEF_TOOL_NAME, "mood_check_memes_def")
         self.assertEqual(constants.ROUGH_SEARCH_MEMES_TOOL_NAME, "mood_rough_search_memes")
-        self.assertEqual(constants.PLUGIN_VERSION, "2.0.0")
+        self.assertEqual(constants.PLUGIN_VERSION, "2.0.1")
 
     def test_legacy_modules_removed(self):
         self.assertFalse((PLUGIN_DIR / "legacy_bridge.py").exists())
