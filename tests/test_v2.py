@@ -399,6 +399,13 @@ class TestRenderer(TempDirCase):
         self.assertIn(":tag_00:", catalog)
         self.assertNotIn(":tag_05:", catalog)
 
+    def test_marker_tokens_truncated_beyond_limit(self):
+        storage = _FakeFacadeStorage([_meme("a", ("t8",))])
+        renderer = StickerRenderer(storage)
+        decorated = run(renderer.decorate_text(":t1:t2:t3:t4:t5:t6:t7:t8:", "s"))
+        images = [s for s in decorated.segments if s.kind == "image"]
+        self.assertEqual(images, [])
+
 
 class TestFacadeSearchAndAlloc(TempDirCase):
     def _facade(self) -> facade_mod.PluginFacade:

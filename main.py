@@ -135,7 +135,7 @@ class MoodOfTheMomentPlugin(Star):
             task = asyncio.create_task(
                 self.facade.maybe_auto_collect_image(
                     image_url=image_url,
-                    source_origin=str(event.get_group_id()),
+                    source_origin=str(event.unified_msg_origin),
                     source_user=str(event.get_sender_id()),
                 )
             )

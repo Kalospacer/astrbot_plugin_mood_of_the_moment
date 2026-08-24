@@ -31,24 +31,3 @@ filename 要求：
 
 description 必须是稳定、可供另一个模型判断是否使用该图片的视觉与使用说明。
 tags 至少返回一个简短分组标签。"""
-
-FALLBACK_REVIEW_NEGATIVE_MARKERS = (
-    "不适合",
-    "不应该偷",
-    "不建议偷",
-    "不是表情包",
-    "不是梗图",
-    "不是二次元",
-    'should_steal": false',
-    "should_steal:false",
-)
-FALLBACK_REVIEW_POSITIVE_MARKERS = (
-    "是表情包",
-    "是梗图",
-    "是二次元",
-    "适合作为聊天表情包",
-    "适合做表情包",
-    "适合作为表情包",
-    'should_steal": true',
-    "should_steal:true",
-)

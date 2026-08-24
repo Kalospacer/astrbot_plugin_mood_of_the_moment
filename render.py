@@ -11,6 +11,10 @@ from astrbot.api.message_components import Image, Plain
 
 from .models import DecoratedContent, DecoratedSegment, ParsedMarker
 
+# 参与 tag 组合匹配的最大 token 数，超出部分直接截断，
+# 避免子集数量随 token 数指数膨胀。
+_MAX_MATCH_TOKENS = 6
+
 
 class StickerRenderer:
     def __init__(
@@ -126,14 +130,6 @@ class StickerRenderer:
         return score
 
     @staticmethod
-    def _iter_tag_subsets(requested_tags: tuple[str, ...]) -> list[tuple[str, ...]]:
-        normalized = tuple(tag for tag in requested_tags if tag)
-        result: list[tuple[str, ...]] = []
-        for size in range(len(normalized), 0, -1):
-            result.extend(combinations(normalized, size))
-        return result
-
-    @staticmethod
     def _pick_top_scored_asset(scored_assets: list[tuple[float, dict]]) -> dict | None:
         if not scored_assets:
             return None
@@ -150,6 +146,7 @@ class StickerRenderer:
     async def _select_best_tag_asset(self, requested_tags: tuple[str, ...]) -> dict | None:
         if not requested_tags:
             return None
+        requested_tags = requested_tags[:_MAX_MATCH_TOKENS]
         for size in range(len(requested_tags), 0, -1):
             candidates: list[dict] = []
             for subset in combinations(requested_tags, size):

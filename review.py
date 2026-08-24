@@ -5,11 +5,7 @@ import re
 
 from astrbot.api import logger
 
-from .constants import (
-    DEFAULT_REVIEW_SYSTEM_PROMPT,
-    FALLBACK_REVIEW_NEGATIVE_MARKERS,
-    FALLBACK_REVIEW_POSITIVE_MARKERS,
-)
+from .constants import DEFAULT_REVIEW_SYSTEM_PROMPT
 
 
 class ReviewService:
@@ -60,13 +56,6 @@ class ReviewService:
             except json.JSONDecodeError:
                 start = text.find("{", start + 1)
         return None
-
-    @staticmethod
-    def _fallback_should_steal(result_text: str) -> bool:
-        lowered = result_text.lower()
-        if any(marker in lowered for marker in FALLBACK_REVIEW_NEGATIVE_MARKERS):
-            return False
-        return any(marker in lowered for marker in FALLBACK_REVIEW_POSITIVE_MARKERS)
 
     @staticmethod
     def _empty_result(reason: str) -> dict:

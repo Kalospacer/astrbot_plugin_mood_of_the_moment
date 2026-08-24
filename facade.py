@@ -106,7 +106,7 @@ class PluginFacade:
         await self._prune_orphan_thumbnails()
 
     async def _prune_orphan_thumbnails(self) -> None:
-        """清理无对应资产的孤兒缩略图。"""
+        """清理无对应资产的孤儿缩略图。"""
         thumb_dir = self.paths.data_dir / ".thumbnails"
         if not thumb_dir.is_dir():
             return
@@ -137,7 +137,7 @@ class PluginFacade:
 
         removed_count = await asyncio.to_thread(_clean)
         if removed_count:
-            logger.info(f"此刻的心情: 启动时清理孤兒缩略图 {removed_count} 个")
+            logger.info(f"此刻的心情: 启动时清理孤儿缩略图 {removed_count} 个")
 
     async def shutdown(self) -> None:
         await self.storage.close()
