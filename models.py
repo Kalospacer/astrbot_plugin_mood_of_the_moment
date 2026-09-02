@@ -11,6 +11,11 @@ class PluginPaths:
     stickers_dir: Path
     metadata_db: Path
 
+    @property
+    def thumbnails_dir(self) -> Path:
+        """缩略图缓存目录（page_api 与 facade 共用的唯一定义）。"""
+        return self.data_dir / ".thumbnails"
+
 
 @dataclass(slots=True)
 class StickerAsset:

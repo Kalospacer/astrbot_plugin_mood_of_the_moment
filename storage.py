@@ -506,14 +506,6 @@ class StickerStorage:
         )
         return definitions[:limit] if limit is not None else definitions
 
-    async def get_tag_index(self) -> dict[str, list[str]]:
-        assets = await self.query_assets()
-        index: dict[str, list[str]] = {}
-        for asset in assets:
-            for tag in asset.tags:
-                index.setdefault(tag, []).append(asset.asset_id)
-        return index
-
     async def get_memes_by_tags(
         self, tags: list[str], match_all: bool = True
     ) -> list[dict[str, Any]]:
@@ -522,28 +514,13 @@ class StickerStorage:
         )
         result: list[dict[str, Any]] = []
         for asset in assets:
-            resolved_path = await self.resolve_path(asset.storage_key)
-            result.append(
-                {
-                    "asset_id": asset.asset_id,
-                    "meme_def": asset.meme_def,
-                    "file_path": str(resolved_path),
-                    "tags": list(asset.tags),
-                    "description": asset.description,
-                    "source": asset.source,
-                    "usage_count": asset.usage_count,
-                    "last_used_at": asset.last_used_at,
-                    "added_time": asset.created_at,
-                }
-            )
+            item = await self._asset_to_dict(asset)
+            if item:
+                result.append(item)
         return result
 
     async def get_meme_by_def(self, meme_def: str) -> dict[str, Any] | None:
         asset = await self.get_asset_by_meme_def(meme_def)
-        return await self._asset_to_dict(asset) if asset else None
-
-    async def get_meme_by_id(self, asset_id: str) -> dict[str, Any] | None:
-        asset = await self.get_asset(asset_id)
         return await self._asset_to_dict(asset) if asset else None
 
     async def _asset_to_dict(self, asset: StickerAsset | None) -> dict[str, Any] | None:
@@ -571,37 +548,6 @@ class StickerStorage:
             )
         )
 
-    async def get_sticker_count(self) -> int:
-        return await self.count_assets()
-
-    async def get_usage_stats(self) -> dict[str, Any]:
-        assets = await self.query_assets()
-        total_count = len(assets)
-        total_usage = sum(asset.usage_count for asset in assets)
-        least_used = min(
-            assets, key=lambda item: (item.usage_count, item.created_at), default=None
-        )
-        most_used = max(
-            assets, key=lambda item: (item.usage_count, item.created_at), default=None
-        )
-        return {
-            "total_count": total_count,
-            "total_usage": total_usage,
-            "avg_usage": total_usage / total_count if total_count else 0,
-            "least_used": {
-                "meme_def": least_used.meme_def,
-                "usage_count": least_used.usage_count,
-            }
-            if least_used
-            else None,
-            "most_used": {
-                "meme_def": most_used.meme_def,
-                "usage_count": most_used.usage_count,
-            }
-            if most_used
-            else None,
-        }
-
     async def get_least_used_memes(self, count: int) -> list[dict[str, Any]]:
         assets = sorted(
             await self.query_assets(),
@@ -613,33 +559,3 @@ class StickerStorage:
             if item:
                 result.append(item)
         return result
-
-    async def get_all_memes(self) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for asset in await self.query_assets():
-            item = await self._asset_to_dict(asset)
-            if item:
-                result.append(item)
-        return result
-
-    async def get_meme_by_file_path(
-        self, file_path: str | Path
-    ) -> dict[str, Any] | None:
-        target = Path(file_path).resolve()
-        for asset in await self.query_assets():
-            if await self.resolve_path(asset.storage_key) == target:
-                return await self._asset_to_dict(asset)
-        return None
-
-    async def delete_meme(self, asset_id: str) -> bool:
-        asset = await self.delete_asset(asset_id)
-        if asset is None:
-            return False
-        await self.delete_file(asset.storage_key)
-        return True
-
-    async def iter_all_sticker_files(self) -> list[Path]:
-        return [
-            await self.resolve_path(asset.storage_key)
-            for asset in await self.query_assets()
-        ]

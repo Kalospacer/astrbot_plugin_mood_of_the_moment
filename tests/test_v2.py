@@ -399,8 +399,18 @@ class TestRenderer(TempDirCase):
         self.assertIn(":tag_00:", catalog)
         self.assertNotIn(":tag_05:", catalog)
 
-    def test_marker_tokens_truncated_beyond_limit(self):
+    def test_marker_tokens_beyond_limit_fall_back_to_single_tag(self):
+        # 回归：超过组合枚举上限的 token 不能按位置丢弃——
+        # 唯一命中的 tag 位于第 8 位时仍应通过单 tag 兜底发图。
         storage = _FakeFacadeStorage([_meme("a", ("t8",))])
+        renderer = StickerRenderer(storage)
+        decorated = run(renderer.decorate_text(":t1:t2:t3:t4:t5:t6:t7:t8:", "s"))
+        images = [s for s in decorated.segments if s.kind == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertIn("a.png", images[0].value)
+
+    def test_marker_tokens_beyond_limit_no_match_still_silent(self):
+        storage = _FakeFacadeStorage([_meme("a", ("zzz",))])
         renderer = StickerRenderer(storage)
         decorated = run(renderer.decorate_text(":t1:t2:t3:t4:t5:t6:t7:t8:", "s"))
         images = [s for s in decorated.segments if s.kind == "image"]
@@ -929,7 +939,7 @@ class TestToolNames(TempDirCase):
         self.assertEqual(constants.STEAL_TOOL_NAME, "mood_steal_memes")
         self.assertEqual(constants.CHECK_MEMES_DEF_TOOL_NAME, "mood_check_memes_def")
         self.assertEqual(constants.ROUGH_SEARCH_MEMES_TOOL_NAME, "mood_rough_search_memes")
-        self.assertEqual(constants.PLUGIN_VERSION, "2.0.1")
+        self.assertEqual(constants.PLUGIN_VERSION, "2.0.2")
 
     def test_legacy_modules_removed(self):
         self.assertFalse((PLUGIN_DIR / "legacy_bridge.py").exists())

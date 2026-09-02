@@ -11,6 +11,7 @@ from .constants import (
     ROUGH_SEARCH_MEMES_TOOL_NAME,
     STEAL_TOOL_NAME,
 )
+from .utils import is_remote_http_url
 
 
 class MemesFacadeProtocol(Protocol):
@@ -170,7 +171,7 @@ class StealMemesTool(FunctionTool):
         _ = context
         if self.facade is None:
             raise RuntimeError("StealMemesTool facade is not initialized")
-        if image_path.startswith(("http://", "https://")):
+        if is_remote_http_url(image_path):
             result = await self.facade.save_remote_image(
                 image_url=image_path,
                 meme_def=meme_def,

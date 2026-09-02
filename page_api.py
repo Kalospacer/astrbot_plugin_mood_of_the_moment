@@ -15,7 +15,7 @@ from quart import request
 from .constants import PLUGIN_NAME, PLUGIN_PACKAGE_NAME
 from .legacy_formatter import LegacyFormatService
 from .models import StickerAsset
-from .utils import normalize_meme_def, normalize_tags, safe_filename
+from .utils import is_remote_http_url, normalize_meme_def, normalize_tags, safe_filename
 
 try:
     from PIL import Image
@@ -116,6 +116,8 @@ class MoodPageApi:
                     continue
                 filtered.append(asset)
             filtered.sort(key=self._asset_sort_key(sort_by), reverse=sort_order == "desc")
+            # 越界页码钳回最后一页：批量删除清空尾页后前端停在空页的问题需双侧兜底。
+            page = min(page, max(1, -(-len(filtered) // page_size)))
             start = (page - 1) * page_size
             return self._ok(
                 {
@@ -144,7 +146,7 @@ class MoodPageApi:
         return self._ok(await self._serialize_asset(asset, include_path=True))
 
     def _thumbnail_dir(self) -> Path:
-        return self.plugin.paths.data_dir / ".thumbnails"
+        return self.plugin.paths.thumbnails_dir
 
     async def _get_or_create_thumbnail(self, asset: StickerAsset, source: Path) -> Path | None:
         return await asyncio.to_thread(self._build_thumbnail_sync, asset, source)
@@ -176,37 +178,6 @@ class MoodPageApi:
         except OSError:
             pass
 
-    async def prune_orphan_thumbnails(self) -> int:
-        """清理没有对应资产的孤兒缩略图，返回清理数量。"""
-        return await asyncio.to_thread(self._prune_orphan_thumbnails_sync)
-
-    def _prune_orphan_thumbnails_sync(self) -> int:
-        thumb_dir = self._thumbnail_dir()
-        if not thumb_dir.is_dir():
-            return 0
-        valid_ids = set()
-        # 同步查库（仅在启动时调用一次）。
-        import sqlite3 as _sqlite3
-        db = self.plugin.paths.metadata_db
-        if db.is_file():
-            try:
-                with _sqlite3.connect(str(db)) as conn:
-                    valid_ids = {
-                        str(row[0])
-                        for row in conn.execute("SELECT asset_id FROM sticker_assets")
-                    }
-            except Exception:
-                return 0
-        removed = 0
-        for path in thumb_dir.glob("*.webp"):
-            if path.stem not in valid_ids:
-                try:
-                    path.unlink()
-                    removed += 1
-                except OSError:
-                    pass
-        return removed
-
     async def get_sticker_image_data(self) -> dict[str, Any]:
         resolved = await self._resolve_asset_image_path()
         if isinstance(resolved, dict):
@@ -214,10 +185,14 @@ class MoodPageApi:
         try:
             raw = await asyncio.to_thread(resolved.read_bytes)
             mime = mimetypes.guess_type(str(resolved))[0] or "image/png"
-            return self._ok({"data_url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}", "mime": mime})
+            return self._ok({"data_url": self._b64_data_url(raw, mime), "mime": mime})
         except Exception as exc:
             logger.error(f"{PLUGIN_NAME}: WebUI image read failed: {exc}", exc_info=True)
             return self._error(str(exc))
+
+    @staticmethod
+    def _b64_data_url(raw: bytes, mime: str) -> str:
+        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
     async def get_sticker_thumbnail_data(self) -> dict[str, Any]:
         asset_id = self._query("asset_id", 120)
@@ -238,22 +213,22 @@ class MoodPageApi:
         thumb = await self._get_or_create_thumbnail(asset, source)
         if thumb is not None:
             raw = await asyncio.to_thread(thumb.read_bytes)
-            return {"data_url": f"data:image/webp;base64,{base64.b64encode(raw).decode('ascii')}", "mime": "image/webp"}
+            return {"data_url": self._b64_data_url(raw, "image/webp"), "mime": "image/webp"}
         # Pillow 缺失或原图无法缩略时回退原图字节，保证仍可显示。
         raw = await asyncio.to_thread(source.read_bytes)
         mime = mimetypes.guess_type(str(source))[0] or "image/png"
-        return {"data_url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}", "mime": mime}
+        return {"data_url": self._b64_data_url(raw, mime), "mime": mime}
 
     async def import_sticker(self) -> dict[str, Any]:
         payload = await request.get_json(silent=True) or {}
         image_source = self._single_line(payload.get("image_source"), 500)
         meme_def = normalize_meme_def(payload.get("meme_def"))
-        tags = self._normalize_tags(payload.get("tags"))
+        tags = normalize_tags(payload.get("tags"))
         description = self._text(payload.get("description"), 2000)
         if not image_source or not meme_def or not tags or not description:
             return self._error("请提供图片、meme_def、至少一个 tag 和 description")
         try:
-            if image_source.startswith(("http://", "https://")):
+            if is_remote_http_url(image_source):
                 result = await self.plugin.facade.save_remote_image(
                     image_url=image_source,
                     meme_def=meme_def,
@@ -280,7 +255,7 @@ class MoodPageApi:
         payload = await request.get_json(silent=True) or {}
         raw_data_url = str(payload.get("data_url") or "").strip()
         meme_def = normalize_meme_def(payload.get("meme_def"))
-        tags = self._normalize_tags(payload.get("tags"))
+        tags = normalize_tags(payload.get("tags"))
         description = self._text(payload.get("description"), 2000)
         if not raw_data_url or not meme_def or not tags or not description:
             return self._error("请选择图片，并提供 meme_def、至少一个 tag 和 description")
@@ -318,7 +293,7 @@ class MoodPageApi:
         payload = await request.get_json(silent=True) or {}
         asset_id = self._single_line(payload.get("asset_id"), 120)
         meme_def = normalize_meme_def(payload.get("meme_def"))
-        tags = self._normalize_tags(payload.get("tags"))
+        tags = normalize_tags(payload.get("tags"))
         description = self._text(payload.get("description"), 2000)
         source = self._text(payload.get("source"), 500)
         if not asset_id or not meme_def or not tags or not description:
@@ -353,7 +328,8 @@ class MoodPageApi:
 
     async def bulk_delete_stickers(self) -> dict[str, Any]:
         payload = await request.get_json(silent=True) or {}
-        asset_ids = [self._single_line(item, 120) for item in payload.get("asset_ids", []) if self._single_line(item, 120)][:100]
+        # 上限防一次请求滥用；超出部分不删除，通过 errors 如实返回。
+        asset_ids = [self._single_line(item, 120) for item in payload.get("asset_ids", []) if self._single_line(item, 120)][:500]
         if not asset_ids or not bool(payload.get("confirm")):
             return self._error("批量删除需要 asset_ids 和 confirm=true")
         deleted: list[str] = []
@@ -396,7 +372,8 @@ class MoodPageApi:
 
     async def list_format_plugin_dirs(self) -> dict[str, Any]:
         try:
-            return self._ok({"items": self.formatter.list_sibling_plugin_dirs()})
+            # 递归扫描兄弟插件目录属磁盘 IO，下沉线程池避免阻塞事件循环。
+            return self._ok({"items": await asyncio.to_thread(self.formatter.list_sibling_plugin_dirs)})
         except Exception as exc:
             return self._error(str(exc))
 
@@ -458,6 +435,7 @@ class MoodPageApi:
             "min_stickers_to_keep": ("int", 0, None),
             "steal_all_images": ("bool",),
             "only_store_emojis": ("bool",),
+            "webui_upload_max_mb": ("int", 1, 200),
         }
         updates: dict[str, Any] = {}
         for key, rules in schema.items():
@@ -545,15 +523,13 @@ class MoodPageApi:
     async def _definition_available(self, meme_def: str, exclude_asset_id: str) -> bool:
         normalized = meme_def.casefold()
         for asset in await self.plugin.facade.storage.query_assets():
-            if asset.asset_id != exclude_asset_id and asset.meme_def.casefold() == normalized:
+            if asset.asset_id == exclude_asset_id:
+                continue
+            if asset.meme_def.casefold() == normalized:
                 return False
-            if asset.asset_id != exclude_asset_id and normalized in {tag.casefold() for tag in asset.tags}:
+            if normalized in {tag.casefold() for tag in asset.tags}:
                 return False
         return True
-
-    @staticmethod
-    def _normalize_tags(value: Any) -> tuple[str, ...]:
-        return normalize_tags(value)
 
     @staticmethod
     def _text(value: Any, limit: int) -> str:

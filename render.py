@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Iterable
 import re
 from difflib import SequenceMatcher
 from itertools import combinations
 
-from astrbot.api import logger
-from astrbot.api.message_components import Image, Plain
-
 from .models import DecoratedContent, DecoratedSegment, ParsedMarker
 
-# 参与 tag 组合匹配的最大 token 数，超出部分直接截断，
-# 避免子集数量随 token 数指数膨胀。
+# 参与 tag 组合匹配的最大 token 数。超出部分不再枚举两两组合（子集数随
+# token 数指数膨胀），但仍逐个参与 size=1 的单 tag 兜底探测，保证任何
+# 位置的可命中 tag 都不会被静默丢弃。
 _MAX_MATCH_TOKENS = 6
 
 
@@ -146,30 +143,46 @@ class StickerRenderer:
     async def _select_best_tag_asset(self, requested_tags: tuple[str, ...]) -> dict | None:
         if not requested_tags:
             return None
-        requested_tags = requested_tags[:_MAX_MATCH_TOKENS]
-        for size in range(len(requested_tags), 0, -1):
+        combo_tags = requested_tags[:_MAX_MATCH_TOKENS]
+        extra_tags = requested_tags[_MAX_MATCH_TOKENS:]
+        for size in range(len(combo_tags), 0, -1):
             candidates: list[dict] = []
-            for subset in combinations(requested_tags, size):
+            for subset in combinations(combo_tags, size):
                 candidates.extend(
                     await self.storage.get_memes_by_tags(list(subset), match_all=True)
                 )
-            unique: dict[str, dict] = {
-                str(asset.get("asset_id")): asset
-                for asset in candidates
-                if asset.get("asset_id")
-            }
+            unique = self._dedupe_candidates(candidates)
             if unique:
-                scored = [
-                    (
-                        self._score_asset_match(
-                            requested_tags, tuple(asset.get("tags") or ())
-                        ),
-                        asset,
-                    )
-                    for asset in unique.values()
-                ]
-                return self._pick_top_scored_asset(scored)
+                return self._pick_top_scored_asset(self._score_candidates(requested_tags, unique))
+        # 超出组合枚举上限的 token 逐个做单 tag 兜底探测，
+        # 避免按位置截断后可命中的 tag 被静默丢弃。
+        for tag in extra_tags:
+            candidates = await self.storage.get_memes_by_tags([tag], match_all=True)
+            unique = self._dedupe_candidates(candidates)
+            if unique:
+                return self._pick_top_scored_asset(self._score_candidates(requested_tags, unique))
         return None
+
+    @staticmethod
+    def _dedupe_candidates(candidates: list[dict]) -> dict[str, dict]:
+        return {
+            str(asset.get("asset_id")): asset
+            for asset in candidates
+            if asset.get("asset_id")
+        }
+
+    def _score_candidates(
+        self, requested_tags: tuple[str, ...], unique: dict[str, dict]
+    ) -> list[tuple[float, dict]]:
+        return [
+            (
+                self._score_asset_match(
+                    requested_tags, tuple(asset.get("tags") or ())
+                ),
+                asset,
+            )
+            for asset in unique.values()
+        ]
 
     async def _select_asset(self, tokens: tuple[str, ...]) -> dict | None:
         if len(tokens) == 1:
@@ -219,17 +232,3 @@ class StickerRenderer:
         if text_buffer:
             merged.append(DecoratedSegment(kind="text", value="".join(text_buffer)))
         return DecoratedContent(segments=merged)
-
-    async def render_text(self, text: str) -> list:
-        try:
-            decorated = await self.decorate_text(text, scope_key="legacy-render")
-            components = []
-            for segment in decorated.segments:
-                if segment.kind == "image":
-                    components.append(Image.fromFileSystem(segment.value))
-                else:
-                    components.append(Plain(segment.value))
-            return components
-        except Exception as exc:
-            logger.error(f"此刻的心情: 处理表情标签时出错: {exc}", exc_info=True)
-            return [Plain(text)]

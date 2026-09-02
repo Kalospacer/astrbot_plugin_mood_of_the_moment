@@ -12,7 +12,7 @@ from uuid import uuid4
 from astrbot.api import logger
 
 from .constants import SUPPORTED_IMAGE_SUFFIXES
-from .models import PluginPaths, StickerAssetDraft
+from .models import StickerAssetDraft
 from .utils import is_path_within_roots, normalize_meme_def, normalize_tags, safe_filename
 
 
@@ -388,14 +388,21 @@ class LegacyFormatService:
         if self._task and not self._task.done():
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
-        shutil.rmtree(Path(str(self._job["staging_dir"])), ignore_errors=True)
+        # 删除 staging 属磁盘 IO，下沉线程池避免阻塞事件循环。
+        await asyncio.to_thread(
+            shutil.rmtree, Path(str(self._job["staging_dir"])), ignore_errors=True
+        )
+        await asyncio.to_thread(self._remove_staging_root)
+        self._job["status"] = "cancelled"
+        self.plugin.facade.format_busy = False
+        return self.status()
+
+    def _remove_staging_root(self) -> None:
+        # staging 根目录仅在空时移除；非空说明还有别的东西，保留。
         try:
             self.staging_root.rmdir()
         except OSError:
             pass
-        self._job["status"] = "cancelled"
-        self.plugin.facade.format_busy = False
-        return self.status()
 
     async def _run_prepare(self) -> None:
         assert self._job is not None

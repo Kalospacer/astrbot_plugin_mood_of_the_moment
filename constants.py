@@ -1,7 +1,7 @@
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 PLUGIN_NAME = "此刻的心情"
 PLUGIN_PACKAGE_NAME = "astrbot_plugin_mood_of_the_moment"
-PLUGIN_VERSION = "2.0.1"
+PLUGIN_VERSION = "2.0.2"
 
 STEAL_TOOL_NAME = "mood_steal_memes"
 CHECK_MEMES_DEF_TOOL_NAME = "mood_check_memes_def"

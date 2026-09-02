@@ -27,3 +27,4 @@ enable_auto_cleanup: true
 min_stickers_to_keep: 0
 steal_all_images: false
 only_store_emojis: false
+webui_upload_max_mb: 20

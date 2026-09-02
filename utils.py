@@ -5,6 +5,13 @@ import re
 import time
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import urlparse
+
+
+def is_remote_http_url(source: str | None) -> bool:
+    """判定字符串是否为 http/https 远程地址（大小写不敏感，供多模块共用）。"""
+    parsed = urlparse(str(source or ""))
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def normalize_meme_def(value: str | None) -> str:

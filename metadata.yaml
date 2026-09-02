@@ -1,5 +1,5 @@
 name: astrbot_plugin_mood_of_the_moment
-version: "2.0.1"
+version: "2.0.2"
 description: "meme_def 精确选图与 tag 分组兜底的 AstrBot 表情包插件。"
 author: "Kalo"
 repo: "https://github.com/Kalospacer/astrbot_plugin_mood_of_the_moment"

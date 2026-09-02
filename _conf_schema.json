@@ -67,5 +67,11 @@
     "description": "仅偷取商城表情",
     "type": "bool",
     "default": false
+  },
+  "webui_upload_max_mb": {
+    "description": "WebUI 单次上传图片大小上限（MB）",
+    "hint": "网页面板添加表情时允许的最大图片体积，超过将拒绝上传",
+    "type": "int",
+    "default": 20
   }
 }

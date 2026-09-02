@@ -1,5 +1,7 @@
 const HTTP_API = "/astrbot_plugin_mood_of_the_moment/page";
 const PAGE_ENDPOINT_PREFIX = "page";
+// 图片 base64 缓存上限（约 5 页缩略图的量级），超过后淘汰最久未用项。
+const IMAGE_CACHE_MAX = 240;
 
 const state = {
   overview: null,
@@ -24,6 +26,9 @@ const state = {
   providers: [],
   formatJob: null,
   formatTimer: null,
+  // 单调递增请求序号：慢网下先发出的旧响应晚回包时直接丢弃，
+  // 防止覆盖新的搜索/筛选/翻页结果。
+  stickersRequestSeq: 0,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -160,6 +165,7 @@ async function loadOverview() {
 }
 
 async function loadStickers() {
+  const seq = ++state.stickersRequestSeq;
   const params = new URLSearchParams();
   const { q, tag, status, sortBy, sortOrder, page, pageSize } = state.filters;
   if (q) params.set("q", q);
@@ -171,11 +177,26 @@ async function loadStickers() {
   params.set("page_size", String(pageSize));
 
   const result = await fetchJson(`/stickers?${params.toString()}`);
+  if (seq !== state.stickersRequestSeq) return; // 已有更新的请求在途，丢弃旧响应
   state.stickers = result.items || [];
   state.filters.total = Number(result.total || 0);
-  state.filters.page = Number(result.page || page);
+  // 服务端已把越界页钳回最后一页；此处再钳一次兜底（如 total 由并发变更缩小）。
+  state.filters.page = Math.min(Number(result.page || page), totalPages());
   state.filters.sortBy = result.sort_by || sortBy;
   state.filters.sortOrder = result.sort_order || sortOrder;
+}
+
+// 统一入口：变更筛选条件后重置页码 → 拉列表 → 整页重渲（六处筛选操作共用）。
+async function applyFilters(mutator) {
+  try {
+    if (typeof mutator === "function") mutator(state.filters);
+    state.filters.page = 1;
+    await loadStickers();
+  } catch (err) {
+    showToast(err.message || "加载失败", "error");
+    return;
+  }
+  renderAll();
 }
 
 function renderAll() {
@@ -244,6 +265,16 @@ function renderStickerWall() {
   hydrateImages(wall);
 }
 
+// 选择集变化后的局部更新：只翻当前卡片的选中态，不重建整面墙。
+function syncCardSelection(assetId) {
+  const card = $(`#stickerWall article.sticker[data-asset-id="${CSS.escape(assetId)}"]`);
+  if (!card) return;
+  const selected = state.selectedIds.has(assetId);
+  card.classList.toggle("is-selected", selected);
+  const checkbox = $('input[data-select-asset]', card);
+  if (checkbox) checkbox.checked = selected;
+}
+
 function renderSelectionBar() {
   const bar = $("#selectionBar");
   if (!bar) return;
@@ -262,14 +293,16 @@ async function hydrateImages(root = document) {
   await Promise.all(imgs.map(async (img) => {
     const endpoint = img.dataset.fetchSrc;
     if (!endpoint || img.src) return;
-    if (state.imageCache.has(endpoint)) {
-      img.src = state.imageCache.get(endpoint);
+    const cached = state.imageCache.get(endpoint);
+    if (cached) {
+      touchImageCache(endpoint, cached);
+      img.src = cached;
       return;
     }
     try {
       const result = await fetchJson(endpoint);
       if (result?.data_url) {
-        state.imageCache.set(endpoint, result.data_url);
+        touchImageCache(endpoint, result.data_url);
         img.src = result.data_url;
       } else {
         img.alt = "图片加载失败";
@@ -280,6 +313,15 @@ async function hydrateImages(root = document) {
   }));
 }
 
+// LRU 语义：Map 的插入序即访问序，命中与写入都把键挪到末尾，超限删最旧键。
+function touchImageCache(endpoint, dataUrl) {
+  state.imageCache.delete(endpoint);
+  state.imageCache.set(endpoint, dataUrl);
+  if (state.imageCache.size > IMAGE_CACHE_MAX) {
+    state.imageCache.delete(state.imageCache.keys().next().value);
+  }
+}
+
 function renderDetailDrawer() {
   const panel = $("#detailPanel");
   if (!panel) return;
@@ -288,15 +330,28 @@ function renderDetailDrawer() {
     panel.innerHTML = `<div class="empty">未选择贴纸</div>`;
     return;
   }
+  // 重建前捕获未保存的表单输入：编辑到一半时搜索/翻页/刷新触发的
+  // renderAll 不应清空用户已输入的内容。仅当旧表单与本次渲染的是
+  // 同一张贴纸时回填，切换贴纸不把旧输入带进新表单。
+  const priorForm = $("#detailForm");
+  const pending = {};
+  if (priorForm && priorForm.dataset.assetId === asset.asset_id) {
+    for (const name of ["meme_def", "tags", "description", "source"]) {
+      pending[name] = formValue(priorForm, name);
+    }
+  }
+  const valueOf = (name, fallback) =>
+    pending[name] !== undefined && pending[name] !== "" ? pending[name] : fallback;
+
   panel.innerHTML = `
     <div class="detail-image">
       ${asset.exists ? `<img alt="${escapeHtml(asset.meme_def)}" data-fetch-src="${escapeHtml(asset.image_endpoint || "")}" />` : `<span class="missing-text">文件缺失</span>`}
     </div>
-    <form id="detailForm" class="detail-form">
-      <label><span>meme_def（唯一名称）</span><input name="meme_def" value="${escapeHtml(asset.meme_def)}" required /></label>
-      <label><span>tags（逗号分隔）</span><input name="tags" value="${escapeHtml((asset.tags || []).join(", "))}" required /></label>
-      <label><span>描述</span><textarea name="description" required>${escapeHtml(asset.description || "")}</textarea></label>
-      <label><span>来源</span><input name="source" value="${escapeHtml(asset.source || "")}" /></label>
+    <form id="detailForm" class="detail-form" data-asset-id="${escapeHtml(asset.asset_id)}">
+      <label><span>meme_def（唯一名称）</span><input name="meme_def" value="${escapeHtml(valueOf("meme_def", asset.meme_def))}" required /></label>
+      <label><span>tags（逗号分隔）</span><input name="tags" value="${escapeHtml(valueOf("tags", (asset.tags || []).join(", ")))}" required /></label>
+      <label><span>描述</span><textarea name="description" required>${escapeHtml(valueOf("description", asset.description || ""))}</textarea></label>
+      <label><span>来源</span><input name="source" value="${escapeHtml(valueOf("source", asset.source || ""))}" /></label>
       <label><span>发送标记</span><code>:${escapeHtml(asset.meme_def)}:</code></label>
       <label><span>asset_id</span><code>${escapeHtml(asset.asset_id)}</code></label>
       <label><span>文件</span><code>${escapeHtml(asset.storage_key || asset.file_path || "")}</code></label>
@@ -334,9 +389,21 @@ async function goToPage(target, { scroll = true } = {}) {
   const pages = totalPages();
   const next = Math.min(pages, Math.max(1, Number(target) || 1));
   if (next === state.filters.page) return;
+  const prevPage = state.filters.page;
   state.filters.page = next;
-  await loadStickers();
-  renderAll();
+  try {
+    await loadStickers();
+  } catch (err) {
+    // 拉取失败回滚页码并恢复分页器，避免内容与页码错位。
+    state.filters.page = prevPage;
+    renderPager();
+    showToast(err.message || "加载失败", "error");
+    return;
+  }
+  renderStats();
+  renderStickerWall();
+  renderSelectionBar();
+  renderPager();
   if (scroll) {
     const library = document.querySelector(".library");
     if (library) library.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -382,8 +449,15 @@ function renderPager() {
 }
 
 async function selectAssetForEdit(assetId) {
+  let asset;
+  try {
+    asset = await fetchJson(`/sticker?asset_id=${encodeURIComponent(assetId)}`);
+  } catch (err) {
+    showToast(err.message || "加载详情失败", "error");
+    return;
+  }
   state.selectedAssetId = assetId;
-  state.selectedAsset = await fetchJson(`/sticker?asset_id=${encodeURIComponent(assetId)}`);
+  state.selectedAsset = asset;
   renderDetailDrawer();
   $("#detailDrawer").setAttribute("aria-hidden", "false");
 }
@@ -400,12 +474,28 @@ function toggleSelectMode(on) {
     btn.classList.toggle("accent", !on);
     btn.classList.toggle("ghost", on);
   }
-  $("#openImportBtn").hidden = on;
-  $("#refreshBtn").hidden = on;
+  syncToolbarVisibility();
+}
+
+// 工具栏显隐的单一事实源：文档模式隐藏批量选择/导入/刷新/设置（文档按钮
+// 本身除外——它要变成「返回」），选择模式隐藏导入/刷新。
+// 修复退出文档视图后选择模式的隐藏状态没有恢复的冲突。
+function syncToolbarVisibility() {
+  $("#openImportBtn").hidden = state.docsMode || state.isSelectMode;
+  $("#refreshBtn").hidden = state.docsMode || state.isSelectMode;
+  $("#bulkSelectBtn").hidden = state.docsMode;
+  $("#openSettingsBtn").hidden = state.docsMode;
 }
 
 async function reloadAfterMutation(message) {
-  await loadAll();
+  try {
+    await loadAll();
+  } catch (err) {
+    // 变更本身已成功（调用方 toast 过成功消息），只是列表刷新失败：
+    // 不能把"删除失败"式的误导塞给用户，提示手动刷新即可。
+    showToast("列表刷新失败，请点击刷新重试", "error");
+    return;
+  }
   if (state.selectedAssetId) {
     try {
       state.selectedAsset = await fetchJson(`/sticker?asset_id=${encodeURIComponent(state.selectedAssetId)}`);
@@ -555,13 +645,25 @@ function stopFormatPolling() {
   }
 }
 
-async function refreshFormatStatus(render = true) {
+// 轮询生命周期由任务状态驱动、与弹窗开关解耦：弹窗关了任务仍在跑，
+// 顶栏徽标也要实时更新；状态离开 preparing 时 tick 自动停表。
+function startFormatPolling() {
+  if (state.formatTimer) return;
+  state.formatTimer = setInterval(async () => {
+    const modalVisible = !$("#formatModal")?.hidden;
+    await refreshFormatStatus(modalVisible);
+    if (state.formatJob?.status !== "preparing") stopFormatPolling();
+  }, 1500);
+}
+
+async function refreshFormatStatus(renderBody = true) {
   try {
     state.formatJob = await fetchJson("/maintenance/format_old_library/status");
   } catch (err) {
     state.formatJob = { status: "error", error: err.message };
   }
-  if (render) renderFormatBody();
+  renderStats(); // 顶栏徽标无条件刷新（无论弹窗是否可见）
+  if (renderBody) renderFormatBody();
 }
 
 async function openFormatModal() {
@@ -573,7 +675,7 @@ async function openFormatModal() {
 }
 
 function closeFormatModal() {
-  stopFormatPolling();
+  // 不停轮询：任务可能仍在后台跑，徽标需要继续更新，tick 结束时自会停。
   $("#formatModal").hidden = true;
 }
 
@@ -618,7 +720,6 @@ function renderFormatBody() {
         <button id="startFormatBtn" type="button" class="primary">开始</button>
       </div>
     `;
-    stopFormatPolling();
     // 绑定来源切换
     $$('input[name="format_source"]', body).forEach((radio) => {
       radio.addEventListener("change", async (e) => {
@@ -714,11 +815,7 @@ function renderFormatBody() {
   `;
 
   if (status === "preparing") {
-    if (!state.formatTimer) {
-      state.formatTimer = setInterval(() => refreshFormatStatus(), 1500);
-    }
-  } else {
-    stopFormatPolling();
+    startFormatPolling();
   }
 }
 
@@ -863,10 +960,7 @@ function toggleDocsView(on) {
     btn.classList.toggle("ghost", !on);
   }
   // 文档模式下隐藏其他操作按钮（含筛选行里的批量选择入口）
-  ["#refreshBtn", "#bulkSelectBtn", "#openSettingsBtn", "#openImportBtn"].forEach((sel) => {
-    const el = document.querySelector(sel);
-    if (el) el.hidden = on;
-  });
+  syncToolbarVisibility();
   renderPager();
 }
 
@@ -947,12 +1041,13 @@ document.addEventListener("click", async (event) => {
   if (openTarget) {
     const assetId = openTarget.dataset.openAsset;
     if (state.isSelectMode) {
+      // 局部更新：只翻当前卡片选中态，不再整墙重建。
       if (state.selectedIds.has(assetId)) {
         state.selectedIds.delete(assetId);
       } else {
         state.selectedIds.add(assetId);
       }
-      renderStickerWall();
+      syncCardSelection(assetId);
       renderSelectionBar();
     } else {
       await selectAssetForEdit(assetId);
@@ -963,18 +1058,16 @@ document.addEventListener("click", async (event) => {
   const tagBtn = target.closest?.("[data-filter-tag]");
   if (tagBtn) {
     const value = tagBtn.dataset.filterTag;
-    state.filters.page = 1;
-    state.filters.tag = state.filters.tag === value ? "" : value;
-    await loadStickers();
-    renderAll();
+    await applyFilters((filters) => {
+      filters.tag = filters.tag === value ? "" : value;
+    });
     return;
   }
 
   if (target.id === "clearFilterBtn") {
-    state.filters.tag = "";
-    state.filters.page = 1;
-    await loadStickers();
-    renderAll();
+    await applyFilters((filters) => {
+      filters.tag = "";
+    });
     return;
   }
 
@@ -1013,21 +1106,22 @@ document.addEventListener("click", async (event) => {
         method: "POST",
         body: { asset_id: state.selectedAssetId, confirm: true },
       });
-      state.selectedIds.delete(state.selectedAssetId);
-      state.selectedAssetId = "";
-      state.selectedAsset = null;
-      $("#detailDrawer").setAttribute("aria-hidden", "true");
-      await reloadAfterMutation("已删除");
     } catch (err) {
       showToast(err.message || "删除失败", "error");
+      return;
     }
+    state.selectedIds.delete(state.selectedAssetId);
+    state.selectedAssetId = "";
+    state.selectedAsset = null;
+    $("#detailDrawer").setAttribute("aria-hidden", "true");
+    await reloadAfterMutation("已删除");
     return;
   }
 
   if (target.id === "selectAllPageBtn") {
-    // 全选本页：把当前页的 id 并入选择集（不清空其他页已选）
+    // 全选本页：把当前页的 id 并入选择集（不清空其他页已选），逐卡局部更新
     state.stickers.forEach((asset) => state.selectedIds.add(asset.asset_id));
-    renderStickerWall();
+    state.stickers.forEach((asset) => syncCardSelection(asset.asset_id));
     renderSelectionBar();
     return;
   }
@@ -1036,8 +1130,8 @@ document.addEventListener("click", async (event) => {
     state.stickers.forEach((asset) => {
       if (state.selectedIds.has(asset.asset_id)) state.selectedIds.delete(asset.asset_id);
       else state.selectedIds.add(asset.asset_id);
+      syncCardSelection(asset.asset_id);
     });
-    renderStickerWall();
     renderSelectionBar();
     return;
   }
@@ -1046,16 +1140,24 @@ document.addEventListener("click", async (event) => {
     const assetIds = [...state.selectedIds];
     if (!assetIds.length) return;
     if (!(await customConfirm(`确认删除选中的 ${assetIds.length} 张贴纸？`))) return;
+    let result;
     try {
-      await fetchJson("/sticker/bulk_delete", {
+      result = await fetchJson("/sticker/bulk_delete", {
         method: "POST",
         body: { asset_ids: assetIds, confirm: true },
       });
-      toggleSelectMode(false);
-      await reloadAfterMutation("已批量删除");
     } catch (err) {
       showToast(err.message || "批量删除失败", "error");
+      return;
     }
+    toggleSelectMode(false);
+    const errors = result?.errors || [];
+    await reloadAfterMutation(
+      errors.length
+        ? `已删除 ${result.deleted?.length || 0} 张，${errors.length} 张失败`
+        : "已批量删除"
+    );
+    if (errors.length) showToast(`部分删除失败：${errors[0]}`, "error");
     return;
   }
 
@@ -1087,32 +1189,28 @@ document.addEventListener("change", async (event) => {
   }
 
   if (target.id === "statusFilter") {
-    state.filters.status = target.value;
-    state.filters.page = 1;
-    await loadStickers();
-    renderAll();
+    await applyFilters((filters) => {
+      filters.status = target.value;
+    });
     return;
   }
   if (target.id === "sortBySelect") {
-    state.filters.sortBy = target.value || "created_at";
-    state.filters.page = 1;
-    await loadStickers();
-    renderAll();
+    await applyFilters((filters) => {
+      filters.sortBy = target.value || "created_at";
+    });
     return;
   }
   if (target.id === "sortOrderSelect") {
-    state.filters.sortOrder = target.value;
-    state.filters.page = 1;
-    await loadStickers();
-    renderAll();
+    await applyFilters((filters) => {
+      filters.sortOrder = target.value;
+    });
   }
 });
 
 $("#searchInput")?.addEventListener("input", debounce(async (event) => {
-  state.filters.q = event.target.value.trim();
-  state.filters.page = 1;
-  await loadStickers();
-  renderAll();
+  await applyFilters((filters) => {
+    filters.q = event.target.value.trim();
+  });
 }, 220));
 
 // 跳页输入框：回车直接跳转

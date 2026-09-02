@@ -18,7 +18,6 @@ from .models import (
     IngestResult,
     PluginPaths,
     StickerAssetDraft,
-    StickerUsageEvent,
 )
 from .render import StickerRenderer
 from .review import ReviewService
@@ -26,6 +25,7 @@ from .storage import StickerStorage
 from .utils import (
     get_allowed_image_roots,
     is_path_within_roots,
+    is_remote_http_url,
     normalize_meme_def,
     normalize_tags,
     resolve_user_path,
@@ -107,7 +107,7 @@ class PluginFacade:
 
     async def _prune_orphan_thumbnails(self) -> None:
         """清理无对应资产的孤儿缩略图。"""
-        thumb_dir = self.paths.data_dir / ".thumbnails"
+        thumb_dir = self.paths.thumbnails_dir
         if not thumb_dir.is_dir():
             return
 
@@ -150,8 +150,7 @@ class PluginFacade:
 
     @staticmethod
     def _is_remote_image_source(image_source: str) -> bool:
-        parsed = urlparse(image_source)
-        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+        return is_remote_http_url(image_source)
 
     @staticmethod
     def _mask_identifier(value: str) -> str:
@@ -509,7 +508,7 @@ class PluginFacade:
         await self.dedup.unregister_asset(asset)
         # 同步清理缩略图缓存。
         try:
-            (self.paths.data_dir / ".thumbnails" / f"{asset_id}.webp").unlink(missing_ok=True)
+            (self.paths.thumbnails_dir / f"{asset_id}.webp").unlink(missing_ok=True)
         except OSError:
             pass
         return DeleteResult(ok=True, message=f"已删除图片资产: {asset.meme_def}", asset=asset)
