@@ -61,7 +61,12 @@ class StickerRenderer:
             r"(?<![a-zA-Z0-9_-])"
             r"(?:(?::|：)[a-zA-Z0-9_\-\u4e00-\u9fff ]+)+(?:[:：])"
         )
-        token_pattern = re.compile(r"[:：]([a-zA-Z0-9_\-\u4e00-\u9fff ]+)")
+        tok = r"[a-zA-Z0-9_\-\u4e00-\u9fff]+(?: +[a-zA-Z0-9_\-\u4e00-\u9fff]+)*"
+        pattern = re.compile(
+            r"(?<![a-zA-Z0-9_-])"
+            rf"(?:(?::|：){tok})+(?:[:：])"
+        )
+        token_pattern = re.compile(rf"[:：]({tok})")
         for match in pattern.finditer(text):
             raw_text = match.group(0)
             tokens = tuple(
@@ -185,8 +190,8 @@ class StickerRenderer:
         ]
 
     async def _select_asset(self, tokens: tuple[str, ...]) -> dict | None:
-        if len(tokens) == 1:
-            exact = await self.storage.get_meme_by_def(tokens[0])
+        for token in tokens:
+            exact = await self.storage.get_meme_by_def(token)
             if exact is not None:
                 return exact
         return await self._select_best_tag_asset(tokens)
