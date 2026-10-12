@@ -28,6 +28,7 @@ def _install_astrbot_stub() -> None:
 
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
+    api.__path__ = []
     api.logger = logger
 
     class FunctionTool:  # noqa: D401 - 测试桩
@@ -37,6 +38,20 @@ def _install_astrbot_stub() -> None:
 
     event_mod = types.ModuleType("astrbot.api.event")
     event_mod.AstrMessageEvent = object
+    event_mod.MessageChain = object
+    event_mod.filter = MagicMock()
+    provider_mod = types.ModuleType("astrbot.api.provider")
+    provider_mod.ProviderRequest = object
+    sys.modules["astrbot.api.provider"] = provider_mod
+    star_mod = types.ModuleType("astrbot.api.star")
+    star_mod.Context = object
+    star_mod.Star = object
+    star_mod.StarTools = MagicMock()
+    star_mod.register = lambda *a, **k: (lambda cls: cls)
+    sys.modules["astrbot.api.star"] = star_mod
+    agent_msg_mod = types.ModuleType("astrbot.core.agent.message")
+    agent_msg_mod.TextPart = MagicMock()
+    sys.modules["astrbot.core.agent.message"] = agent_msg_mod
 
     mc_mod = types.ModuleType("astrbot.api.message_components")
 
@@ -1086,6 +1101,53 @@ class TestFacadeThumbnailPrune(TempDirCase):
         # 调用清理：db 损坏应返回 0 且不删除任何缩略图
         run(facade._prune_orphan_thumbnails())
         self.assertTrue(f.exists(), "数据库异常时不应删除缩略图")
+
+
+class TestSendMessagePatch(TempDirCase):
+    def test_send_message_patch_decorates_sticker_tags(self):
+        mc_mod = sys.modules["astrbot.api.message_components"]
+        Plain = mc_mod.Plain
+        Image = mc_mod.Image
+
+        sent_chains = []
+        original_send = AsyncMock(side_effect=lambda s, mc: sent_chains.append(mc))
+        ctx = types.SimpleNamespace(send_message=original_send)
+
+        plugin_cls = getattr(importlib.import_module(f"{_pkg_name}.main"), "MoodOfTheMomentPlugin")
+        plugin = plugin_cls.__new__(plugin_cls)
+        plugin.context = ctx
+        plugin.facade = MagicMock()
+
+        models_mod = importlib.import_module(f"{_pkg_name}.models")
+
+        async def fake_decorate(text, scope_key):
+            if ":猫猫:" in text:
+                return models_mod.DecoratedContent(
+                    segments=[
+                        models_mod.DecoratedSegment(kind="text", value="前文 "),
+                        models_mod.DecoratedSegment(kind="image", value=str(self.tmp / "cat.png")),
+                        models_mod.DecoratedSegment(kind="text", value=" 后文"),
+                    ]
+                )
+            return models_mod.DecoratedContent(segments=[models_mod.DecoratedSegment(kind="text", value=text)])
+
+        plugin.facade.decorate_text = fake_decorate
+        plugin._install_send_message_patch()
+
+        mc = types.SimpleNamespace(chain=[Plain("前文 :猫猫: 后文")])
+        run(ctx.send_message("napcat:GroupMessage:123", mc))
+
+        self.assertEqual(len(sent_chains), 1)
+        res_chain = sent_chains[0].chain
+        self.assertEqual(len(res_chain), 3)
+        self.assertEqual(res_chain[0].text, "前文 ")
+        self.assertEqual(res_chain[1], ("image", str(self.tmp / "cat.png")))
+        self.assertEqual(res_chain[2].text, " 后文")
+        self.assertTrue(getattr(sent_chains[0], "_mood_decorated", False))
+
+        # 验证卸载恢复
+        plugin._uninstall_send_message_patch()
+        self.assertIs(ctx.send_message, original_send)
 
 
 if __name__ == "__main__":

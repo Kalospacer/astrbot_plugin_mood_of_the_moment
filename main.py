@@ -96,9 +96,43 @@ class MoodOfTheMomentPlugin(Star):
         task.add_done_callback(self._finalize_task)
 
     async def initialize(self):
+        self._install_send_message_patch()
         self.page_api.register_routes()
         await self.facade.startup()
         logger.info(f"{PLUGIN_NAME}: 插件已初始化")
+
+    def _install_send_message_patch(self) -> None:
+        if getattr(self.context, "_mood_send_patched", False):
+            return
+        original = self.context.send_message
+        self._original_send_message = original
+        setattr(self.context, "_mood_send_patched", True)
+
+        async def patched_send_message(session, message_chain):
+            if not getattr(message_chain, "_mood_decorated", False):
+                chain = getattr(message_chain, "chain", None)
+                if chain:
+                    try:
+                        scope_key = str(session)
+                        message_chain.chain = await self._decorate_chain_components(
+                            chain, scope_key
+                        )
+                        setattr(message_chain, "_mood_decorated", True)
+                    except Exception as e:
+                        logger.warning(f"{PLUGIN_NAME}: 主动发送装饰失败: {e}")
+            return await original(session, message_chain)
+
+        self.context.send_message = patched_send_message
+
+    def _uninstall_send_message_patch(self) -> None:
+        if getattr(self.context, "_mood_send_patched", False):
+            if hasattr(self, "_original_send_message"):
+                self.context.send_message = self._original_send_message
+            setattr(self.context, "_mood_send_patched", False)
+
+    @filter.on_astrbot_loaded()
+    async def _on_loaded(self) -> None:
+        self._install_send_message_patch()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -149,18 +183,16 @@ class MoodOfTheMomentPlugin(Star):
         _ = event
         _inject_sticker_reminder(req, await self.facade.build_llm_summary())
 
-    @filter.on_decorating_result(priority=500)
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        result = event.get_result()
-        if result is None or not getattr(result, "chain", None):
-            return
+    async def _decorate_chain_components(
+        self, chain: list, scope_key: str
+    ) -> list:
         new_chain = []
-        for item in result.chain:
+        for item in chain:
             text = getattr(item, "text", None)
             if isinstance(text, str):
                 decorated = await self.facade.decorate_text(
                     text=text,
-                    scope_key=event.unified_msg_origin,
+                    scope_key=scope_key,
                 )
                 for segment in decorated.segments:
                     if segment.kind == "image":
@@ -169,7 +201,16 @@ class MoodOfTheMomentPlugin(Star):
                         new_chain.append(Plain(segment.value))
             else:
                 new_chain.append(item)
-        result.chain = new_chain
+        return new_chain
+
+    @filter.on_decorating_result(priority=500)
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        result = event.get_result()
+        if result is None or not getattr(result, "chain", None):
+            return
+        result.chain = await self._decorate_chain_components(
+            result.chain, str(event.unified_msg_origin)
+        )
 
     @filter.command("mood_check")
     async def check_meme(self, event: AstrMessageEvent, limit: int = 5) -> None:
@@ -202,6 +243,7 @@ class MoodOfTheMomentPlugin(Star):
         await event.send(MessageChain().message(result.message))
 
     async def terminate(self):
+        self._uninstall_send_message_patch()
         for tool_name in (
             STEAL_TOOL_NAME,
             CHECK_MEMES_DEF_TOOL_NAME,
