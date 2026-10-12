@@ -334,13 +334,18 @@ class TestRenderer(TempDirCase):
         renderer = StickerRenderer(storage, max_stickers_per_message=1)
         decorated = run(
             renderer.decorate_text(
-                "来了来了\n\n:小棕熊_暗中观察: :小人_委屈瘪嘴: :小猫_张嘴震惊:",
+                "来了来了\n\n:小棕熊_暗中观察: :小人_委屈瘪嘴: :小猫_张嘴震惊:\n\n收尾",
                 "s1",
             )
         )
-        images = [s for s in decorated.segments if s.kind == "image"]
-        self.assertEqual(len(images), 1)
-        self.assertEqual(images[0].value, "/tmp/小棕熊_暗中观察.png")
+        self.assertEqual(
+            [(s.kind, s.value) for s in decorated.segments],
+            [
+                ("text", "来了来了\n\n"),
+                ("image", "/tmp/小棕熊_暗中观察.png"),
+                ("text", "\n\n收尾"),
+            ],
+        )
 
     def test_single_tag_fallback_scoring(self):
         storage = _FakeFacadeStorage([

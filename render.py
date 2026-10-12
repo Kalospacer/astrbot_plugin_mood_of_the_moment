@@ -206,9 +206,11 @@ class StickerRenderer:
         stickers_used = 0
         for marker in markers:
             if marker.start > cursor:
-                segments.append(
-                    DecoratedSegment(kind="text", value=text[cursor : marker.start])
-                )
+                between = text[cursor : marker.start]
+                if not (segments and not between.strip(" \t")):
+                    segments.append(
+                        DecoratedSegment(kind="text", value=between)
+                    )
             asset = await self._select_asset(marker.tokens)
             if asset is not None and stickers_used < self.max_stickers_per_message:
                 file_path = str(asset.get("file_path") or "")
