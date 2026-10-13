@@ -188,7 +188,10 @@ class MoodOfTheMomentPlugin(Star):
     ) -> list:
         new_chain = []
         for item in chain:
-            text = getattr(item, "text", None)
+            # 只装饰纯文本组件。Record/Image 等组件的 text 只是附带说明
+            # （例如 TTS 语音带的原文），不是待发送正文；按 text 属性重建组件
+            # 会把语音降级成文字发出去。
+            text = item.text if isinstance(item, Plain) else None
             if isinstance(text, str):
                 decorated = await self.facade.decorate_text(
                     text=text,
